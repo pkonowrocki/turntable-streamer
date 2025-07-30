@@ -1,0 +1,20 @@
+# Pliki generowane przez kompilator i system budowania
+/build/
+
+# Pliki tymczasowe i backupy konfiguracji
+/sdkconfig.old
+
+# Komponenty zarządzane przez menedżer zależności ESP-IDF
+# Plik dependencies.lock ZAPEWNIA, że zawsze zostaną pobrane te same wersje
+/managed_components/
+
+# Pliki konfiguracyjne specyficzne dla edytora VS Code
+# Każdy deweloper może mieć własne ustawienia
+/.vscode/
+
+# Pliki specyficzne dla serwera językowego (np. autouzupełnianie kodu)
+/.clangd
+
+# Inne pliki tymczasowe, które mogą się pojawić
+*.bak
+*.tmp
