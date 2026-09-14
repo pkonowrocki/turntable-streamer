@@ -4,107 +4,24 @@
 
 **Goal:** Let the device fetch and flash new firmware from a URL pasted into its web UI, without bricking itself on a bad download.
 
-**Architecture:** Switch from the current single-app partition table to a custom two-slot OTA table sized for this board's 4MB flash. Add a new `ota_manager.c/h` wrapping ESP-IDF's built-in `esp_https_ota`, triggered from a new `/ota` endpoint on the web server the core-hardening plan added.
+**Architecture:** Add a new `ota_manager.c/h` wrapping ESP-IDF's built-in `esp_https_ota`, triggered from a new `/ota` endpoint on the web server the core-hardening plan added. The two-OTA-slot partition table and 4MB flash size this needs were already done as part of core-hardening's Task 1 (they turned out to be needed before that plan even finished, not something to defer here) — this plan only adds the code that uses them.
 
 **Tech Stack:** ESP-IDF's `esp_https_ota` component (built in, no new dependency).
 
 **Spec:** `docs/superpowers/specs/2026-09-14-nest-streaming-hardening-design.md`
 
-**Depends on:** `docs/superpowers/plans/2026-09-14-core-hardening.md` (Task 3's `start_webserver(uint16_t port, bool captive)` and the STA-mode web UI must exist first).
+**Depends on:** `docs/superpowers/plans/2026-09-14-core-hardening.md` — Task 1's `partitions.csv` (`ota_0`/`ota_1` slots) and 4MB flash size, and Task 3's `start_webserver(uint16_t port, bool captive)` / STA-mode web UI, must exist first.
 
 ## Global Constraints
 
 - Toolchain is installed at `~/esp/esp-idf` (v5.3.3) and `~/esp/esp-adf` (v2.7); `IDF_PATH`/`ADF_PATH` are persistent env vars, but the toolchain's own PATH additions are not — dot-source `~/esp/esp-idf/export.ps1` in the same command as every `idf.py` call (see the core-hardening plan's Global Constraints for the exact one-liner). On-device flash/verify steps still need a human at the board.
-- ESP-ADF has no MP3 encoder — this project uses AAC throughout (see the spec's "Codec: AAC, not MP3" section and the core-hardening plan). Not directly relevant to this plan's own code, but the stream path referenced below is `/stream.aac`, not `.mp3`.
-- Flash size confirmed as 4MB (`CONFIG_ESPTOOLPY_FLASHSIZE=4MB` after this plan's Task 1; it's currently `2MB` in `sdkconfig`, which Task 1 also fixes since it was never updated to match the real hardware).
+- ESP-ADF has no MP3 encoder, and `http_stream` is an HTTP client (not a server) — this project uses AAC served via `raw_stream` + this project's own `esp_http_server` throughout (see the spec and the core-hardening plan). Not directly relevant to this plan's own code, but the stream path referenced below is `/stream.aac`.
+- Flash size and the `ota_0`/`ota_1` partition table already exist by the time this plan starts (core-hardening's Task 1) — don't recreate `partitions.csv` or touch flash-size config here.
 - Spec: `docs/superpowers/specs/2026-09-14-nest-streaming-hardening-design.md`
 
 ---
 
-### Task 1: Custom two-slot OTA partition table
-
-**Files:**
-- Create: `partitions.csv`
-- Modify: `sdkconfig`
-
-**Interfaces:**
-- Produces: partitions named `ota_0`/`ota_1` plus `otadata`/`nvs`/`phy_init` — consumed implicitly by `esp_https_ota` (Task 2) via the standard IDF OTA partition APIs it calls internally.
-
-- [ ] **Step 1: Create `partitions.csv` at the repo root**
-
-Sized for 4MB flash: two 1.75MB app slots (plenty for an ESP-ADF + Wi-Fi + MQTT + HTTPS + OTA image), leaving headroom below the 4MB ceiling.
-
-```
-# Name,   Type, SubType, Offset,   Size,     Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-otadata,  data, ota,     0xf000,   0x2000,
-phy_init, data, phy,     0x11000,  0x1000,
-ota_0,    app,  ota_0,   0x20000,  0x1C0000,
-ota_1,    app,  ota_1,   0x1E0000, 0x1C0000,
-```
-
-- [ ] **Step 2: Switch `sdkconfig` to the custom table and the real flash size**
-
-Change:
-```
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
-```
-to:
-```
-# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
-```
-
-Change:
-```
-# CONFIG_PARTITION_TABLE_CUSTOM is not set
-```
-to:
-```
-CONFIG_PARTITION_TABLE_CUSTOM=y
-```
-
-Change `CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp.csv"` to `CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"` (leave `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"` as-is — it already matches).
-
-Change the flash size block from:
-```
-# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
-# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE="2MB"
-```
-to:
-```
-# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
-# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
-CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-```
-
-- [ ] **Step 3: Build**
-
-Run: `idf.py build`
-Expected: clean build. Also run `idf.py partition-table` and confirm both `ota_0`/`ota_1` show and the app binary size printed at the end of `idf.py build` is comfortably under `0x1C0000` (1,835,008) bytes — if it isn't, stop and enlarge the partitions before continuing to Task 2.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add partitions.csv sdkconfig
-git commit -m "Switch to a custom two-slot OTA partition table sized for 4MB flash"
-```
-
----
-
-### Task 2: `ota_manager` component
+### Task 1: `ota_manager` component
 
 **Files:**
 - Create: `main/ota_manager.h`
@@ -113,9 +30,9 @@ git commit -m "Switch to a custom two-slot OTA partition table sized for 4MB fla
 
 **Interfaces:**
 - Produces:
-  - `void ota_manager_install_async(const char *url);` — saves `url` as the last-used OTA URL and installs it; safe to call from an HTTP handler (Task 3 uses this).
+  - `void ota_manager_install_async(const char *url);` — saves `url` as the last-used OTA URL and installs it; safe to call from an HTTP handler (Task 2 uses this).
   - `void ota_manager_install_last_async(void);` — re-installs whatever URL was last saved; the MQTT plan's "Install update" button calls this.
-- Consumes: NVS namespace `"storage"` (shared with `app_config_t`, under its own key `"ota_url"` so it doesn't touch the config blob's layout).
+- Consumes: NVS namespace `"storage"` (shared with `app_config_t`, under its own key `"ota_url"` so it doesn't touch the config blob's layout). Consumes the `ota_0`/`ota_1` partitions from core-hardening's Task 1 implicitly, via `esp_https_ota`'s standard IDF OTA partition APIs.
 
 - [ ] **Step 1: Write `main/ota_manager.h`**
 
@@ -262,13 +179,13 @@ git commit -m "Add ota_manager: async firmware install via esp_https_ota"
 
 ---
 
-### Task 3: Wire OTA into the web UI
+### Task 2: Wire OTA into the web UI
 
 **Files:**
 - Modify: `main/wifi_manager.c`
 
 **Interfaces:**
-- Consumes: `ota_manager_install_async(const char *url)` (Task 2).
+- Consumes: `ota_manager_install_async(const char *url)` (Task 1).
 - Consumes/modifies: `root_get_handler`, `start_webserver` (from the core-hardening plan's Task 3).
 
 - [ ] **Step 1: Add `#include "ota_manager.h"`** near the other local includes.

@@ -15,10 +15,11 @@
 - Toolchain is installed at `~/esp/esp-idf` (v5.3.3) and `~/esp/esp-adf` (v2.7); `IDF_PATH`/`ADF_PATH` are set as persistent user env vars, but the toolchain's own PATH additions (compiler, cmake, ninja) are **not** persistent — every build command must first dot-source `~/esp/esp-idf/export.ps1` (PowerShell) in the same invocation, e.g.: `. "$env:USERPROFILE\esp\esp-idf\export.ps1"; $env:ADF_PATH = "$env:USERPROFILE\esp\esp-adf"; idf.py build`.
 - No existing test framework (confirmed in `CLAUDE.md`). Verification per task is `idf.py build` (must compile clean) plus the referenced step from the spec's "Verification" section (manual, on-device — a human runs the on-device parts, not the agent).
 - **ESP-ADF has no MP3 encoder** (confirmed against the local v2.7 checkout — see the spec's "Codec: AAC, not MP3" section). This plan uses AAC (`aac_encoder.h`, component `esp-adf-libs`) throughout. Don't reintroduce `mp3_encoder.h`/`rtsp_stream.h` — neither exists in ESP-ADF.
-- ESP-ADF component names verified against the local `~/esp/esp-adf` v2.7 checkout (not just headers — actual `idf_component_register`/`register_component` component names, since IDF resolves `REQUIRES` by component name, not header path): `i2s_stream.h`/`http_stream.h` → component **`audio_stream`**; `aac_encoder.h`/`wav_encoder.h` → component **`esp-adf-libs`**; `es8388.h` → component **`audio_hal`**. If your `$ADF_PATH` checkout is a materially different version, `grep` its `components/*/CMakeLists.txt` for these before compiling.
+- **ESP-ADF's `http_stream` is an HTTP client, not a server** (confirmed by reading `http_stream.c` and ESP-ADF's own `examples/recorder/pipeline_raw_http` — see the spec's "Serving mechanism" section). Don't use `http_stream` as the thing clients connect to. The pipeline ends in a `raw_stream` reader element instead; a `GET /stream.aac` handler on the project's own `esp_http_server` pulls bytes out via `raw_stream_read()`. Neither `http_stream_set_uri` nor `audio_element_set_uri` makes `http_stream` serve anything — don't reach for either here.
+- ESP-ADF component names verified against the local `~/esp/esp-adf` v2.7 checkout (not just headers — actual `idf_component_register`/`register_component` component names, since IDF resolves `REQUIRES` by component name, not header path): `i2s_stream.h`/`raw_stream.h` → component **`audio_stream`**; `aac_encoder.h`/`wav_encoder.h` → component **`esp-adf-libs`**; `es8388.h` → component **`audio_hal`**. `esp_http_server` is ESP-IDF's own component (already in `REQUIRES`, already used by `wifi_manager.c`'s setup UI). If your `$ADF_PATH` checkout is a materially different version, `grep` its `components/*/CMakeLists.txt` for these before compiling.
 - ESP-ADF symbol names for the button/LED work (`periph_button_cfg_t`, `periph_button_event_id_t`, `GREEN_LED_GPIO`, `BUTTON_REC_ID`/`GPIO_NUM_36`) were verified against `github.com/espressif/esp-adf` commit `49f80aa` (same v2.7 release).
 - Board confirmed: LyraT V4.3, 4MB flash, ESP-IDF 5.3.3, target `esp32` (all from `sdkconfig`).
-- Flash size stays at the checked-in `CONFIG_ESPTOOLPY_FLASHSIZE=2MB` for this plan even though the real hardware is 4MB (confirmed earlier) — the OTA plan's Task 1 corrects it alongside switching to the custom OTA partition table. Don't change it here.
+- **Flash size and the OTA partition table move into this plan's Task 1** (originally scoped to the OTA plan). The checked-in `CONFIG_ESPTOOLPY_FLASHSIZE=2MB` was already wrong (real hardware is 4MB, confirmed), and the linked binary — ESP-ADF + Wi-Fi + HTTP server, even before MQTT/OTA/button/LED code — doesn't fit IDF's default single-app partition sizing regardless of codec choice. Since the file has to be touched now anyway, Task 1 goes straight to the final two-OTA-slot shape the OTA plan needs, instead of a temporary single-app table that gets redone later.
 - Root `CMakeLists.txt` had a real bug independent of this plan: `project.cmake` was `include()`-d twice and in the wrong order relative to ESP-ADF's own `CMakeLists.txt`, which made `project()` recurse into itself and crash `cmake`. Already fixed (verified against ESP-ADF's own example projects) to:
   ```
   cmake_minimum_required(VERSION 3.5)
@@ -40,10 +41,12 @@
 - Modify: `main/wifi_manager.c:100-132` (`root_get_handler`, `connect_post_handler`)
 - Modify: `main/CMakeLists.txt`
 - Modify: `sdkconfig`
+- Create: `partitions.csv`
 
 **Interfaces:**
 - Produces: `app_config_t { char ssid[32]; char password[64]; int bitrate; int input_gain_db; }` — the shape every later task (and the OTA/MQTT plans) reads/writes via NVS key `CONFIG_NVS_KEY` in namespace `"storage"`.
-- Produces: `audio_streamer_start(const app_config_t *config)` — signature unchanged, behavior now AAC-only.
+- Produces: `audio_streamer_start(const app_config_t *config)` — signature unchanged, behavior now AAC-only, served via its own `esp_http_server` on port 80 (separate `httpd_handle_t` from `wifi_manager.c`'s setup-UI server — see Task 3, which puts that one on port 8080 in STA mode).
+- Produces: `partitions.csv` with named partitions `nvs`/`otadata`/`phy_init`/`ota_0`/`ota_1` — the OTA plan's Task 2 (`esp_https_ota`) targets `ota_0`/`ota_1` by name; don't rename them later.
 
 - [ ] **Step 1: Rewrite `app_config.h`**
 
@@ -63,20 +66,29 @@ typedef struct {
 #endif // APP_CONFIG_H
 ```
 
-- [ ] **Step 2: Rewrite `audio_streamer.c` to the single AAC branch and apply gain**
+- [ ] **Step 2: Rewrite `audio_streamer.c` to the single AAC branch, served over the device's own `esp_http_server`**
 
 ESP-ADF has no MP3 encoder (see Global Constraints) — this uses `aac_encoder.h`
 (`aac_encoder_cfg_t`/`aac_encoder_init()`, component `esp-adf-libs`), stereo
 44.1kHz, whose valid bitrate range comfortably covers all four dropdown
 options (128k/192k/256k/320k).
 
+ESP-ADF's `http_stream` is an HTTP *client* (see Global Constraints) — it
+cannot serve `/stream.aac` to anything. Instead the pipeline ends in a
+`raw_stream` reader element, and a plain `esp_http_server` instance (ESP-IDF's
+own component, not ESP-ADF's) exposes `GET /stream.aac`, looping
+`raw_stream_read()` → `httpd_resp_send_chunk()` for whichever client is
+connected:
+
 ```c
 /**
  * @file audio_streamer.c
- * @brief AAC-over-HTTP audio streamer: I2S line-in -> AAC encoder -> HTTP server.
+ * @brief AAC audio streamer: I2S line-in -> AAC encoder -> raw_stream,
+ *        served at GET /stream.aac by this file's own esp_http_server.
  */
 
 #include <esp_log.h>
+#include <esp_http_server.h>
 #include <mdns.h>
 
 #include "audio_pipeline.h"
@@ -84,12 +96,46 @@ options (128k/192k/256k/320k).
 #include "board.h"
 #include "i2s_stream.h"
 #include "aac_encoder.h"
-#include "http_stream.h"
+#include "raw_stream.h"
 #include "es8388.h"
 
 #include "audio_streamer.h"
 
 static const char *TAG = "AUDIO_STREAMER";
+
+// ponytail: raw_stream's ring buffer is a single shared FIFO, so two
+// simultaneous GET clients would split one stream's bytes rather than each
+// getting the full thing. Fine for a single-listener hobby stream (Cast
+// normally has one active receiver anyway) -- add per-client fan-out only if
+// real multi-room playback is ever needed.
+static audio_element_handle_t s_raw_reader;
+
+static esp_err_t stream_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "audio/aac");
+    char buf[1024];
+    while (1) {
+        int len = raw_stream_read(s_raw_reader, buf, sizeof(buf));
+        if (len <= 0) {
+            break;
+        }
+        if (httpd_resp_send_chunk(req, buf, len) != ESP_OK) {
+            break; // client disconnected
+        }
+    }
+    return ESP_OK;
+}
+
+static void start_stream_server(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t httpd_cfg = HTTPD_DEFAULT_CONFIG();
+    httpd_cfg.server_port = 80;
+    if (httpd_start(&server, &httpd_cfg) == ESP_OK) {
+        httpd_uri_t stream_uri = {.uri = "/stream.aac", .method = HTTP_GET, .handler = stream_get_handler};
+        httpd_register_uri_handler(server, &stream_uri);
+    }
+}
 
 void audio_streamer_start(const app_config_t *config)
 {
@@ -116,18 +162,20 @@ void audio_streamer_start(const app_config_t *config)
     aac_cfg.bitrate = config->bitrate;
     audio_element_handle_t encoder = aac_encoder_init(&aac_cfg);
 
-    ESP_LOGI(TAG, "Configuring HTTP stream writer...");
-    http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
-    http_cfg.type = AUDIO_STREAM_WRITER;
-    audio_element_handle_t stream_writer = http_stream_init(&http_cfg);
-    http_stream_set_uri(stream_writer, "/stream.aac");
+    ESP_LOGI(TAG, "Configuring raw_stream output tap...");
+    raw_stream_cfg_t raw_cfg = RAW_STREAM_CFG_DEFAULT();
+    raw_cfg.type = AUDIO_STREAM_READER;
+    s_raw_reader = raw_stream_init(&raw_cfg);
 
-    ESP_LOGI(TAG, "Linking elements: i2s -> aac -> http");
+    ESP_LOGI(TAG, "Linking elements: i2s -> aac -> raw");
     audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
     audio_pipeline_register(pipeline, encoder, "aac");
-    audio_pipeline_register(pipeline, stream_writer, "http");
-    const char *link[3] = {"i2s", "aac", "http"};
+    audio_pipeline_register(pipeline, s_raw_reader, "raw");
+    const char *link[3] = {"i2s", "aac", "raw"};
     audio_pipeline_link(pipeline, &link[0], 3);
+
+    ESP_LOGI(TAG, "Starting HTTP stream server on port 80...");
+    start_stream_server();
 
     ESP_LOGI(TAG, "Initializing mDNS service...");
     mdns_init();
@@ -187,10 +235,11 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
 - [ ] **Step 4: Fix `main/CMakeLists.txt` REQUIRES**
 
 The original REQUIRES list never actually covered the headers `audio_streamer.c`
-includes (a pre-existing bug — `i2s_stream.h`/`http_stream.h`/`aac_encoder.h`/
+includes (a pre-existing bug — `i2s_stream.h`/`raw_stream.h`/`aac_encoder.h`/
 `es8388.h` were never resolvable). Per Global Constraints: `i2s_stream.h`/
-`http_stream.h` → component `audio_stream`; `aac_encoder.h` → component
-`esp-adf-libs`; `es8388.h` → component `audio_hal`. Update:
+`raw_stream.h` → component `audio_stream`; `aac_encoder.h` → component
+`esp-adf-libs`; `es8388.h` → component `audio_hal`. `esp_http_server` is
+already in this list. Update:
 
 ```
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c"
@@ -211,20 +260,85 @@ CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
 ```
 i.e. `CONFIG_ESP32_DEFAULT_CPU_FREQ_160=y` → unset, `# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set` → `CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y`, `CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=160` → `=240`.
 
-- [ ] **Step 6: Build**
+- [ ] **Step 6: Custom two-OTA-slot partition table, corrected flash size**
+
+The checked-in `CONFIG_ESPTOOLPY_FLASHSIZE=2MB` was already wrong (real hardware
+is 4MB, confirmed), and IDF's default single-app partition sizing doesn't fit
+this binary regardless of codec. Fix both now, in the final shape the OTA plan
+needs, rather than a temporary table that gets redone later — two 1.75MB app
+slots comfortably fit this binary with room to grow across the rest of this
+plan plus the OTA/MQTT plans.
+
+Create `partitions.csv` at the repo root:
+
+```
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+ota_0,    app,  ota_0,   0x20000,  0x1C0000,
+ota_1,    app,  ota_1,   0x1E0000, 0x1C0000,
+```
+
+In `sdkconfig`, change:
+```
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+```
+to:
+```
+# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+```
+
+Change:
+```
+# CONFIG_PARTITION_TABLE_CUSTOM is not set
+```
+to:
+```
+CONFIG_PARTITION_TABLE_CUSTOM=y
+```
+
+Change `CONFIG_PARTITION_TABLE_FILENAME="partitions_singleapp.csv"` to `CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"` (leave `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"` as-is — it already matches).
+
+Change the flash size block from:
+```
+# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_4MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE="2MB"
+```
+to:
+```
+# CONFIG_ESPTOOLPY_FLASHSIZE_1MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# CONFIG_ESPTOOLPY_FLASHSIZE_8MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_16MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_32MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_64MB is not set
+# CONFIG_ESPTOOLPY_FLASHSIZE_128MB is not set
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+```
+
+- [ ] **Step 7: Build**
 
 Run: `idf.py build`
-Expected: clean build, no errors. (Run this on your machine — see Global Constraints.)
+Expected: clean build, no errors. Also run `idf.py partition-table` and confirm `ota_0`/`ota_1` both show, and the app binary size printed at the end of `idf.py build` is comfortably under `0x1C0000` (1,835,008) bytes. (Run this on your machine — see Global Constraints.)
 
-- [ ] **Step 7: Manual verify**
+- [ ] **Step 8: Manual verify**
 
 Spec step 2: flash, submit the form with real Wi-Fi + a bitrate/gain choice, confirm `http://turntable.local/stream.aac` plays and the line-in signal isn't clipped/too quiet — adjust `gain` and resubmit if needed.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add main/app_config.h main/audio_streamer.c main/wifi_manager.c main/CMakeLists.txt sdkconfig
-git commit -m "Simplify to AAC-only pipeline, add input gain control, bump CPU to 240MHz"
+git add main/app_config.h main/audio_streamer.c main/wifi_manager.c main/CMakeLists.txt sdkconfig partitions.csv
+git commit -m "Simplify to AAC-only pipeline served via raw_stream+esp_http_server, add input gain control, bump CPU to 240MHz, fix flash size and add two-OTA-slot partition table"
 ```
 
 ---
@@ -382,7 +496,7 @@ git commit -m "Add Wi-Fi auto-reconnect with backoff; fix DNS parser pointer-siz
 - Produces: `static httpd_handle_t start_webserver(uint16_t port, bool captive)` — new signature. The OTA plan (Task adding the `/ota` endpoint) registers its handler on the server this returns, so its task must apply on top of this one.
 - Consumes: `root_get_handler`, `connect_post_handler` (Task 1's versions).
 
-The audio pipeline's `http_stream` writer already runs its own embedded HTTP server on port 80 to serve `/stream.aac` once streaming starts. The setup/config server can't also bind port 80 in STA mode — it moves to 8080 there, and drops the AP-only captive-portal wildcard redirect.
+`audio_streamer.c` already runs its own `esp_http_server` instance on port 80 to serve `/stream.aac` once streaming starts (Task 1). The setup/config server can't also bind port 80 in STA mode — it moves to 8080 there, and drops the AP-only captive-portal wildcard redirect.
 
 - [ ] **Step 1: Parameterize `start_webserver` and add a status line**
 

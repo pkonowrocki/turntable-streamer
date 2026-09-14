@@ -48,15 +48,44 @@ one. Same architecture, same Cast-compatibility, no unproven engineering.
 If a genuine need for MP3 specifically ever shows up, the libshine spike
 above is the documented starting point — not attempted here.
 
+## Serving mechanism: raw_stream + esp_http_server, not http_stream (revised 2026-09-14)
+
+A second load-bearing assumption in the original design was also wrong.
+ESP-ADF's `http_stream` audio element — used as `AUDIO_STREAM_WRITER` — is an
+**HTTP client**, not a server: its `_http_open()` calls `esp_http_client_open()`,
+and `http_stream_cfg_t` has no server-mode flag at all. ESP-ADF's own example
+using this exact pipeline shape (`i2s_stream → http_stream`,
+`examples/recorder/pipeline_raw_http`) *uploads* recorded audio to a remote
+server — it does not expose a `GET` endpoint. The pre-existing code's
+`http_stream_set_uri(writer, "/stream.mp3")` (a bare relative path, no host)
+was never a working server endpoint against real ESP-ADF, and
+`http_stream_set_uri` itself doesn't exist in ESP-ADF v2.7 either
+(`audio_element_set_uri` is the real function, but setting it on a
+client-only element doesn't make it a server).
+
+**Decision:** end the pipeline in a `raw_stream` reader element instead
+(`raw_stream_read()` pulls encoded AAC bytes out on demand — this is
+ESP-ADF's documented mechanism for "obtain the pipeline data without an
+output stream"). The device's own `esp_http_server` instance (already used
+for the setup UI) gets a `GET /stream.aac` handler that loops
+`raw_stream_read()` → `httpd_resp_send_chunk()` for each connected client.
+No new dependency — `esp_http_server` is already linked.
+
+Accepted limitation, not engineered around: `raw_stream`'s ring buffer is a
+single shared FIFO, so two simultaneous `GET` clients would split one
+stream's bytes rather than each getting the full thing. Fine for a
+single-listener hobby stream (and Cast normally has one active receiver);
+revisit only if real multi-room playback is ever needed.
+
 ## Audio pipeline
 
 - `app_config_t` (`app_config.h`) drops `stream_mode_t` and `mode`; keeps
   `bitrate` (128/192/256/320 kbps, default 256 — all within AAC's valid
   stereo-at-44.1kHz range) and gains an `input_gain` field.
-- `audio_streamer.c` keeps only the AAC-over-HTTP branch:
-  `i2s_stream_reader → aac_encoder → http_stream` at `/stream.aac`
-  (content-type `audio/aac`), advertised via mDNS as `turntable.local` /
-  `_http._tcp`.
+- `audio_streamer.c` keeps only the AAC branch:
+  `i2s_stream_reader → aac_encoder → raw_stream`, served at `/stream.aac`
+  (content-type `audio/aac`) by the device's own `esp_http_server` instance
+  on port 80, advertised via mDNS as `turntable.local` / `_http._tcp`.
 - I2S reader stays at ADF's default 44.1kHz/16-bit/stereo — matches both
   vinyl's practical bandwidth and AAC's expected input.
 - Input gain is set explicitly via the codec's HAL at startup from
@@ -66,6 +95,15 @@ above is the documented starting point — not attempted here.
   software default can't get right for every turntable/preamp pairing.
 - `sdkconfig`: `CONFIG_ESP32_DEFAULT_CPU_FREQ` 160 MHz → 240 MHz, for margin
   now that MQTT/OTA/button/LED handling share the core with the encoder.
+- `sdkconfig`/`partitions.csv`: flash size corrected from the checked-in
+  (wrong) `2MB` to the confirmed real `4MB`, with a custom two-OTA-slot
+  partition table (`nvs`/`otadata`/`phy_init`/`ota_0`/`ota_1`, 1.75MB per
+  app slot). Moved here from the OTA section below because the linked
+  binary (ESP-ADF + Wi-Fi + HTTP server, even before MQTT/OTA/button/LED
+  code) already doesn't fit IDF's default single-app partition sizing — this
+  was always going to be needed before the plan finished, not a new need
+  from the AAC switch. Doing the partition-table work once, in its final
+  two-slot shape, avoids redoing it again in the OTA pass.
 
 ## Wi-Fi reliability
 
@@ -98,8 +136,9 @@ instead of leaving the stream dead until a manual power cycle.
 
 ## OTA updates
 
-- `sdkconfig`: `CONFIG_PARTITION_TABLE_SINGLE_APP` → `PARTITION_TABLE_TWO_OTA`
-  (no OTA slot exists today).
+- The custom two-OTA-slot partition table (`ota_0`/`ota_1`) was moved into
+  the core-hardening pass's audio-pipeline work (see above) — it turned out
+  to be needed before this plan even starts, not something to defer here.
 - New `ota_manager.c/h`, built on ESP-IDF's built-in `esp_https_ota`
   component (ships with IDF — no new dependency). Manually triggered: user
   pastes a firmware `.bin` URL into the setup web page and submits, or
