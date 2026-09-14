@@ -251,14 +251,25 @@ idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c"
 
 - [ ] **Step 5: Bump CPU clock in `sdkconfig`**
 
-Change these three lines:
+`CONFIG_ESP32_DEFAULT_CPU_FREQ_*` (the symbol name in this project's original,
+pre-toolchain `sdkconfig`) is a dead backward-compat alias in ESP-IDF 5.3.3 —
+confirmed in `build/config/sdkconfig.h`: `#define CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`. Editing it has no effect. The real, live
+symbol (no "32") is `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_*`. Change:
 ```
-# CONFIG_ESP32_DEFAULT_CPU_FREQ_160 is not set
-CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
-# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set   <- was this; becomes the line above
-CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
 ```
-i.e. `CONFIG_ESP32_DEFAULT_CPU_FREQ_160=y` → unset, `# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 is not set` → `CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y`, `CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=160` → `=240`.
+to:
+```
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80 is not set
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+```
+Verify by grepping the generated header after building (Step 7): `grep CPU_FREQ_MHZ build/config/sdkconfig.h` should show `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 240`, not `160`.
 
 - [ ] **Step 6: Custom two-OTA-slot partition table, corrected flash size**
 
