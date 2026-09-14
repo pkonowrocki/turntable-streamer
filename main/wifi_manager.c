@@ -9,6 +9,7 @@
 #include <nvs_flash.h>
 #include <esp_http_server.h>
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "lwip/dns.h"
 #include "lwip/prot/dns.h"
@@ -20,6 +21,9 @@ static const char *TAG = "WIFI_MANAGER";
 static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 
+static esp_timer_handle_t wifi_reconnect_timer;
+static int wifi_retry_count = 0;
+
 // --- Deklaracje funkcji wewnętrznych ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void start_sta_mode(const app_config_t *config);
@@ -27,7 +31,35 @@ static void start_captive_portal(void);
 static void dns_server_task(void *pvParameters);
 void start_dns_server(void) { xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL); }
 
+// Exponential backoff capped at 30s, in ms. retry_count is 0-based.
+static int wifi_backoff_ms(int retry_count) {
+    if (retry_count > 8) retry_count = 8; // 200ms << 8 = 51200ms, already past the 30s cap
+    int delay = 200 << retry_count;
+    return delay > 30000 ? 30000 : delay;
+}
+
+static void wifi_reconnect_timer_cb(void *arg) {
+    esp_wifi_connect();
+}
+
 // --- Implementacja serwera DNS (POPRAWIONA) ---
+#define DNS_HEADER_LEN 12  // struct dns_hdr's wire size: id+flags1+flags2+4x uint16 counts
+
+// Finds the end of the first question in a DNS query packet: just past its
+// QTYPE+QCLASS fields. Returns NULL if the packet is too short or the name
+// field runs off the end of what was actually received (malformed/truncated).
+static uint8_t *dns_question_end(uint8_t *rx_buffer, int rx_len) {
+    if (rx_len < DNS_HEADER_LEN + 1) return NULL;
+    uint8_t *p = rx_buffer + DNS_HEADER_LEN;
+    uint8_t *limit = rx_buffer + rx_len;
+    while (p < limit && *p != 0) {
+        p += (*p + 1);
+    }
+    if (p >= limit) return NULL;
+    p += 1 + 4; // skip the 0x00 name terminator, QTYPE(2), QCLASS(2)
+    return (p <= limit) ? p : NULL;
+}
+
 static void dns_server_task(void *pvParameters) {
     uint8_t rx_buffer[128];
     struct sockaddr_in dest_addr;
@@ -48,47 +80,40 @@ static void dns_server_task(void *pvParameters) {
         struct sockaddr_in source_addr;
         socklen_t socklen = sizeof(source_addr);
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0, (struct sockaddr *)&source_addr, &socklen);
+        if (len <= 0) continue;
 
-        if (len > 0) {
-            // Zdobądź adres IP naszego punktu dostępowego
-            esp_netif_ip_info_t ip_info;
-            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-            esp_netif_get_ip_info(netif, &ip_info);
-            
-            // Odpowiedz tym adresem na każde zapytanie DNS
-            struct dns_hdr *dns_header = (struct dns_hdr *)rx_buffer;
+        uint8_t *query_end = dns_question_end(rx_buffer, len);
+        // The answer record we append needs 16 more bytes (pointer+type+class+ttl+len+A);
+        // bail rather than overflow rx_buffer.
+        if (!query_end || query_end + 16 > rx_buffer + (int)sizeof(rx_buffer)) continue;
 
-            if ((dns_header->flags1 & DNS_FLAG1_RESPONSE) == 0) {
-                dns_header->flags1 |= DNS_FLAG1_RESPONSE | DNS_FLAG1_AUTHORATIVE;
+        esp_netif_ip_info_t ip_info;
+        esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        esp_netif_get_ip_info(netif, &ip_info);
 
-                dns_header->numanswers = dns_header->numquestions;
-                dns_header->numauthrr = htons(0);
-                dns_header->numextrarr = htons(0);
-            }
-
-            uint8_t *query_end = rx_buffer + sizeof(dns_header);
-            while (*query_end != 0) {
-                query_end += (*query_end + 1);
-            }
-            query_end += 5; // Skip QTYPE and QCLASS
-
-            // Stwórz odpowiedź
-            *query_end++ = 0xC0;
-            *query_end++ = 0x0C;
-            *query_end++ = 0x00;
-            *query_end++ = 0x01; // Type A
-            *query_end++ = 0x00;
-            *query_end++ = 0x01; // Class IN
-            *query_end++ = 0x00;
-            *query_end++ = 0x00;
-            *query_end++ = 0x00;
-            *query_end++ = 0x0A; // TTL 10 sekund
-            *query_end++ = 0x00;
-            *query_end++ = 0x04; // Długość danych (4 bajty)
-            memcpy(query_end, &ip_info.ip.addr, sizeof(ip_info.ip.addr));
-            
-            sendto(sock, rx_buffer, (query_end - rx_buffer) + 4, 0, (struct sockaddr *)&source_addr, socklen);
+        struct dns_hdr *dns_header = (struct dns_hdr *)rx_buffer;
+        if ((dns_header->flags1 & DNS_FLAG1_RESPONSE) == 0) {
+            dns_header->flags1 |= DNS_FLAG1_RESPONSE | DNS_FLAG1_AUTHORATIVE;
+            dns_header->numanswers = dns_header->numquestions;
+            dns_header->numauthrr = htons(0);
+            dns_header->numextrarr = htons(0);
         }
+
+        *query_end++ = 0xC0;
+        *query_end++ = 0x0C;
+        *query_end++ = 0x00;
+        *query_end++ = 0x01; // Type A
+        *query_end++ = 0x00;
+        *query_end++ = 0x01; // Class IN
+        *query_end++ = 0x00;
+        *query_end++ = 0x00;
+        *query_end++ = 0x00;
+        *query_end++ = 0x0A; // TTL 10s
+        *query_end++ = 0x00;
+        *query_end++ = 0x04; // RDATA length (4 bytes)
+        memcpy(query_end, &ip_info.ip.addr, sizeof(ip_info.ip.addr));
+
+        sendto(sock, rx_buffer, (query_end - rx_buffer) + 4, 0, (struct sockaddr *)&source_addr, socklen);
     }
     close(sock);
     vTaskDelete(NULL);
@@ -162,6 +187,8 @@ void wifi_manager_start(void) {
 
 static void start_sta_mode(const app_config_t *config) {
     wifi_event_group = xEventGroupCreate();
+    const esp_timer_create_args_t reconnect_timer_args = { .callback = &wifi_reconnect_timer_cb, .name = "wifi_reconnect" };
+    esp_timer_create(&reconnect_timer_args, &wifi_reconnect_timer);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -200,7 +227,12 @@ static void start_captive_portal(void) {
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        int delay_ms = wifi_backoff_ms(wifi_retry_count++);
+        ESP_LOGW(TAG, "Wi-Fi disconnected, retrying in %d ms", delay_ms);
+        esp_timer_start_once(wifi_reconnect_timer, (uint64_t)delay_ms * 1000);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_retry_count = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
