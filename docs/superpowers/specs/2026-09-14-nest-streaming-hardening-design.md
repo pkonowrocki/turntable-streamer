@@ -23,16 +23,42 @@ control, and observability a hobby device left running unattended needs.
 - **No component-per-concern restructuring.** New code stays as flat files
   in `main/`, matching the project's current size (~600 lines).
 
+## Codec: AAC, not MP3 (revised 2026-09-14)
+
+The original design (and the code as it existed before this pass) assumed
+MP3. That's not implementable: **ESP-ADF has never shipped an MP3 encoder**,
+only a decoder (`mp3_decoder.h` exists in `esp-adf-libs`; `mp3_encoder.h`
+does not, in any version) — confirmed against a local ESP-ADF v2.7 checkout.
+The pre-existing `audio_streamer.c`'s `mp3_encoder_init()`/`rtsp_stream_init()`
+calls reference APIs that were never part of any real ESP-ADF release, so
+this project could never have compiled against stock ESP-ADF.
+
+Investigated and rejected: a community MP3 encoder port for ESP32
+(`myvobot/esp32_mp3_encoder`, wrapping the Shine encoder). Measured in its
+own README: ~18s to encode a 10s mono clip — slower than real-time by a wide
+margin, unoptimized, unclear license/maintenance. A from-scratch integration
+of standalone `libshine` as a custom `audio_element` was also considered and
+rejected as an open-ended spike with no guaranteed real-time payoff, when a
+known-good alternative exists.
+
+**Decision: AAC.** ESP-ADF ships a real, actively-maintained AAC encoder
+(`aac_encoder.h` / `aac_encoder_init()`), and Google Cast's default media
+receiver plays a live AAC HTTP stream exactly the way it plays a live MP3
+one. Same architecture, same Cast-compatibility, no unproven engineering.
+If a genuine need for MP3 specifically ever shows up, the libshine spike
+above is the documented starting point — not attempted here.
+
 ## Audio pipeline
 
 - `app_config_t` (`app_config.h`) drops `stream_mode_t` and `mode`; keeps
-  `bitrate` (128/192/256/320 kbps, default 256) and gains an `input_gain`
-  field.
-- `audio_streamer.c` keeps only the MP3-over-HTTP branch:
-  `i2s_stream_reader → mp3_encoder → http_stream` at `/stream.mp3`,
-  advertised via mDNS as `turntable.local` / `_http._tcp`.
+  `bitrate` (128/192/256/320 kbps, default 256 — all within AAC's valid
+  stereo-at-44.1kHz range) and gains an `input_gain` field.
+- `audio_streamer.c` keeps only the AAC-over-HTTP branch:
+  `i2s_stream_reader → aac_encoder → http_stream` at `/stream.aac`
+  (content-type `audio/aac`), advertised via mDNS as `turntable.local` /
+  `_http._tcp`.
 - I2S reader stays at ADF's default 44.1kHz/16-bit/stereo — matches both
-  vinyl's practical bandwidth and MP3's expected input.
+  vinyl's practical bandwidth and AAC's expected input.
 - Input gain is set explicitly via the codec's HAL at startup from
   `config->input_gain` instead of relying on power-on defaults, so a hot
   turntable preamp doesn't clip the ADC. This is user-tunable from the web
@@ -55,7 +81,7 @@ instead of leaving the stream dead until a manual power cycle.
   file for the reliability work above.
 - The setup `httpd` (currently only started in `start_captive_portal()`) now
   also starts in STA mode, on its own path/port separate from the audio
-  `http_stream`'s `/stream.mp3`. It serves: Wi-Fi/mode reconfiguration (as
+  `http_stream`'s `/stream.aac`. It serves: Wi-Fi/mode reconfiguration (as
   today), the OTA firmware-URL field, MQTT broker fields, and input gain —
   and a status view (Wi-Fi RSSI, streaming state).
 
@@ -101,7 +127,7 @@ reconnects independently and never blocks the audio pipeline.
 
   | Entity | Type | Behavior |
   |---|---|---|
-  | Stream URL | `sensor` | State = `http://turntable.local/stream.mp3` |
+  | Stream URL | `sensor` | State = `http://turntable.local/stream.aac` |
   | Streaming | `binary_sensor` | on = audio pipeline running, off = idle/AP mode |
   | Wi-Fi signal | `sensor` | RSSI |
   | Restart | `button` | → `esp_restart()` |
@@ -142,7 +168,7 @@ No subdirectories/components — matches current project size.
 1. Build + flash; confirm captive portal `Turntable-Setup` AP still comes up
    with no saved config.
 2. Submit Wi-Fi + gain + MQTT fields; confirm STA connect, `turntable.local`
-   resolves, `/stream.mp3` plays through a Cast trigger to a real Nest
+   resolves, `/stream.aac` plays through a Cast trigger to a real Nest
    speaker.
 3. Kill the AP momentarily; confirm the stream recovers without a reboot.
 4. Confirm the device appears in Home Assistant via MQTT discovery with all
