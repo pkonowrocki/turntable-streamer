@@ -123,10 +123,38 @@ static void dns_server_task(void *pvParameters) {
 // --- Reszta kodu bez zmian (ale wklej ją dla pewności) ---
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    const char* resp_str = (const char*) R"rawliteral(
-    <!DOCTYPE html><html><head><title>Turntable Wi-Fi Setup</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:sans-serif; background-color:#282c34; color:#fff; padding:20px;} h1,h2{color:#61afef;} input,select{padding:10px; width:calc(100% - 22px); border-radius:5px; border:1px solid #61afef; background-color:#3c4049; color:#fff;} input[type="submit"]{background-color:#98c379; color:#282c34; font-weight:bold; cursor:pointer; width:100%;}</style></head>
-    <body><h1>Turntable Wi-Fi Setup</h1><form action="/connect" method="post"><h2>Wi-Fi Credentials</h2><input type="text" name="ssid" placeholder="WiFi SSID" required><br><br><input type="password" name="password" placeholder="Password"><br><br><h2>Stream</h2><label for="bitrate">AAC Bitrate:</label><br><select name="bitrate" id="bitrate"><option value="128000">128 kbps</option><option value="192000">192 kbps</option><option value="256000" selected>256 kbps</option><option value="320000">320 kbps</option></select><br><br><label for="gain">Line-in Gain:</label><br><select name="gain" id="gain"><option value="0">0 dB</option><option value="3">3 dB</option><option value="6">6 dB</option><option value="9">9 dB</option><option value="12" selected>12 dB</option><option value="15">15 dB</option><option value="18">18 dB</option><option value="21">21 dB</option><option value="24">24 dB</option></select><br><br><input type="submit" value="Save and Restart"></form></body></html>)rawliteral";
-    httpd_resp_send(req, resp_str, strlen(resp_str));
+    char status[240] = "";
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        snprintf(status, sizeof(status),
+                 "<p>Status: streaming, connected to %s (RSSI %d dBm).<br>Stream: "
+                 "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
+                 (char *)ap_info.ssid, ap_info.rssi);
+    }
+    char resp[2048];
+    int n = snprintf(resp, sizeof(resp),
+        "<!DOCTYPE html><html><head><title>Turntable Setup</title>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<style>body{font-family:sans-serif;background-color:#282c34;color:#fff;padding:20px;} "
+        "h1,h2{color:#61afef;} input,select{padding:10px;width:calc(100%% - 22px);border-radius:5px;"
+        "border:1px solid #61afef;background-color:#3c4049;color:#fff;} "
+        "input[type=\"submit\"]{background-color:#98c379;color:#282c34;font-weight:bold;cursor:pointer;width:100%%;}"
+        "</style></head><body><h1>Turntable Setup</h1>%s"
+        "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
+        "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
+        "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
+        "<h2>Stream</h2><label for=\"bitrate\">AAC Bitrate:</label><br>"
+        "<select name=\"bitrate\" id=\"bitrate\"><option value=\"128000\">128 kbps</option>"
+        "<option value=\"192000\">192 kbps</option><option value=\"256000\" selected>256 kbps</option>"
+        "<option value=\"320000\">320 kbps</option></select><br><br>"
+        "<label for=\"gain\">Line-in Gain:</label><br><select name=\"gain\" id=\"gain\">"
+        "<option value=\"0\">0 dB</option><option value=\"3\">3 dB</option><option value=\"6\">6 dB</option>"
+        "<option value=\"9\">9 dB</option><option value=\"12\" selected>12 dB</option>"
+        "<option value=\"15\">15 dB</option><option value=\"18\">18 dB</option>"
+        "<option value=\"21\">21 dB</option><option value=\"24\">24 dB</option></select><br><br>"
+        "<input type=\"submit\" value=\"Save and Restart\"></form></body></html>",
+        status);
+    httpd_resp_send(req, resp, n);
     return ESP_OK;
 }
 
@@ -158,9 +186,10 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-static httpd_handle_t start_webserver(void) {
+static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = port;
     config.max_uri_handlers = 4;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -168,8 +197,10 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &root_uri);
         httpd_uri_t connect_uri = {.uri = "/connect", .method = HTTP_POST, .handler = connect_post_handler};
         httpd_register_uri_handler(server, &connect_uri);
-        httpd_uri_t wildcard = {.uri = "/*", .method = HTTP_GET, .handler = root_get_handler};
-        httpd_register_uri_handler(server, &wildcard);
+        if (captive) {
+            httpd_uri_t wildcard = {.uri = "/*", .method = HTTP_GET, .handler = root_get_handler};
+            httpd_register_uri_handler(server, &wildcard);
+        }
     }
     return server;
 }
@@ -206,6 +237,7 @@ static void start_sta_mode(const app_config_t *config) {
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP. Starting audio streamer.");
         audio_streamer_start(config);
+        start_webserver(8080, false);
     }
 }
 
@@ -221,7 +253,7 @@ static void start_captive_portal(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     start_dns_server();
-    start_webserver();
+    start_webserver(80, true);
 }
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
