@@ -3,17 +3,11 @@
 
 #define CONFIG_NVS_KEY "app_config"
 
-typedef enum {
-    STREAM_MODE_MP3,
-    STREAM_MODE_WAV,
-    STREAM_MODE_RTSP_MP3,
-} stream_mode_t;
-
 typedef struct {
     char ssid[32];
     char password[64];
-    stream_mode_t mode;
-    int bitrate;
+    int bitrate;        // AAC encoder bitrate in bps (128000/192000/256000/320000)
+    int input_gain_db;  // ES8388 line-in gain: 0,3,6,9,12,15,18,21, or 24 (dB)
 } app_config_t;
 
 #endif // APP_CONFIG_H

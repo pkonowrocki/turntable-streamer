@@ -99,9 +99,8 @@ static void dns_server_task(void *pvParameters) {
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
     const char* resp_str = (const char*) R"rawliteral(
-    <!DOCTYPE html><html><head><title>Turntable Wi-Fi Setup</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:sans-serif; background-color:#282c34; color:#fff; padding:20px;} h1,h2{color:#61afef;} input,select{padding:10px; width:calc(100% - 22px); border-radius:5px; border:1px solid #61afef; background-color:#3c4049; color:#fff;} input[type="submit"]{background-color:#98c379; color:#282c34; font-weight:bold; cursor:pointer; width:100%;} #bitrate_div{display:none;}</style></head>
-    <body><h1>Turntable Wi-Fi Setup</h1><form action="/connect" method="post"><h2>Wi-Fi Credentials</h2><input type="text" name="ssid" placeholder="WiFi SSID" required><br><br><input type="password" name="password" placeholder="Password"><br><br><h2>Streaming Mode</h2><input type="radio" id="mode_mp3" name="mode" value="0" checked onchange="toggleBitrate(true)"><label for="mode_mp3"> MP3 Stream (HTTP)</label><br><input type="radio" id="mode_wav" name="mode" value="1" onchange="toggleBitrate(false)"><label for="mode_wav"> WAV Stream (Lossless)</label><br><input type="radio" id="mode_rtsp" name="mode" value="2" onchange="toggleBitrate(true)"><label for="mode_rtsp"> RTSP Stream (Low Latency)</label><br><br><div id="bitrate_div"><label for="bitrate">MP3/RTSP Bitrate:</label><br><select name="bitrate" id="bitrate"><option value="128000">128 kbps</option><option value="192000" selected>192 kbps</option><option value="256000">256 kbps</option><option value="320000">320 kbps</option></select></div><br><br><input type="submit" value="Save and Restart"></form>
-    <script>function toggleBitrate(show){document.getElementById('bitrate_div').style.display = show ? 'block' : 'none';}toggleBitrate(true);</script></body></html>)rawliteral";
+    <!DOCTYPE html><html><head><title>Turntable Wi-Fi Setup</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:sans-serif; background-color:#282c34; color:#fff; padding:20px;} h1,h2{color:#61afef;} input,select{padding:10px; width:calc(100% - 22px); border-radius:5px; border:1px solid #61afef; background-color:#3c4049; color:#fff;} input[type="submit"]{background-color:#98c379; color:#282c34; font-weight:bold; cursor:pointer; width:100%;}</style></head>
+    <body><h1>Turntable Wi-Fi Setup</h1><form action="/connect" method="post"><h2>Wi-Fi Credentials</h2><input type="text" name="ssid" placeholder="WiFi SSID" required><br><br><input type="password" name="password" placeholder="Password"><br><br><h2>Stream</h2><label for="bitrate">AAC Bitrate:</label><br><select name="bitrate" id="bitrate"><option value="128000">128 kbps</option><option value="192000">192 kbps</option><option value="256000" selected>256 kbps</option><option value="320000">320 kbps</option></select><br><br><label for="gain">Line-in Gain:</label><br><select name="gain" id="gain"><option value="0">0 dB</option><option value="3">3 dB</option><option value="6">6 dB</option><option value="9">9 dB</option><option value="12" selected>12 dB</option><option value="15">15 dB</option><option value="18">18 dB</option><option value="21">21 dB</option><option value="24">24 dB</option></select><br><br><input type="submit" value="Save and Restart"></form></body></html>)rawliteral";
     httpd_resp_send(req, resp_str, strlen(resp_str));
     return ESP_OK;
 }
@@ -112,13 +111,16 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
     if (ret <= 0) return ESP_FAIL;
     buf[ret] = '\0';
     app_config_t cfg = {0};
-    char mode_str[8], bitrate_str[16];
-    if (httpd_query_key_value(buf, "ssid", cfg.ssid, sizeof(cfg.ssid)) == ESP_OK && httpd_query_key_value(buf, "password", cfg.password, sizeof(cfg.password)) == ESP_OK && httpd_query_key_value(buf, "mode", mode_str, sizeof(mode_str)) == ESP_OK) {
-        cfg.mode = (stream_mode_t)atoi(mode_str);
-        if (cfg.mode != STREAM_MODE_WAV && httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) {
-            cfg.bitrate = atoi(bitrate_str);
-        } else { cfg.bitrate = 192000; }
-        ESP_LOGI(TAG, "Saving config: SSID=%s, Mode=%d, Bitrate=%d", cfg.ssid, cfg.mode, cfg.bitrate);
+    char bitrate_str[16], gain_str[8];
+    if (httpd_query_key_value(buf, "ssid", cfg.ssid, sizeof(cfg.ssid)) == ESP_OK &&
+        httpd_query_key_value(buf, "password", cfg.password, sizeof(cfg.password)) == ESP_OK) {
+        cfg.bitrate = (httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? atoi(bitrate_str) : 256000;
+        int gain = (httpd_query_key_value(buf, "gain", gain_str, sizeof(gain_str)) == ESP_OK) ? atoi(gain_str) : 12;
+        // Clamp untrusted form input to a valid ES8388 mic-gain step (0-24dB, multiples of 3).
+        if (gain < 0) gain = 0;
+        if (gain > 24) gain = 24;
+        cfg.input_gain_db = (gain / 3) * 3;
+        ESP_LOGI(TAG, "Saving config: SSID=%s, Bitrate=%d, Gain=%ddB", cfg.ssid, cfg.bitrate, cfg.input_gain_db);
         nvs_handle_t nvs;
         nvs_open("storage", NVS_READWRITE, &nvs);
         nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
