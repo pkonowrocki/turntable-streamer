@@ -16,7 +16,8 @@
 
 ## Global Constraints
 
-- Same as the other two plans: no `idf.py` in this sandbox — every build/flash verification runs on your machine.
+- Toolchain is installed at `~/esp/esp-idf` (v5.3.3) and `~/esp/esp-adf` (v2.7); `IDF_PATH`/`ADF_PATH` are persistent env vars, but the toolchain's own PATH additions are not — dot-source `~/esp/esp-idf/export.ps1` in the same command as every `idf.py` call (see the core-hardening plan's Global Constraints for the exact one-liner). On-device flash/verify steps still need a human at the board.
+- ESP-ADF has no MP3 encoder — this project uses AAC throughout (see the spec's "Codec: AAC, not MP3" section and the core-hardening plan). The stream URL this plan publishes to MQTT is `/stream.aac`, not `.mp3`.
 - MQTT must never block the audio pipeline: `mqtt_manager_start` returns as soon as the client is created; `esp_mqtt_client` manages its own connect/retry loop in a background task.
 - Spec: `docs/superpowers/specs/2026-09-14-nest-streaming-hardening-design.md`
 
@@ -42,7 +43,7 @@
 typedef struct {
     char ssid[32];
     char password[64];
-    int bitrate;              // MP3 encoder bitrate in bps (128000/192000/256000/320000)
+    int bitrate;              // AAC encoder bitrate in bps (128000/192000/256000/320000)
     int input_gain_db;        // ES8388 line-in gain: 0,3,6,9,12,15,18,21, or 24 (dB)
     char mqtt_broker_uri[128]; // e.g. "mqtt://192.168.1.10:1883"; empty = MQTT disabled
     char mqtt_username[32];
@@ -63,7 +64,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         snprintf(status, sizeof(status),
                  "<p>Status: streaming, connected to %s (RSSI %d dBm).<br>Stream: "
-                 "<a href=\"http://turntable.local/stream.mp3\">http://turntable.local/stream.mp3</a></p>",
+                 "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
                  (char *)ap_info.ssid, ap_info.rssi);
     }
     char resp[3072];
@@ -78,7 +79,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
         "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
         "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
-        "<h2>Stream</h2><label for=\"bitrate\">MP3 Bitrate:</label><br>"
+        "<h2>Stream</h2><label for=\"bitrate\">AAC Bitrate:</label><br>"
         "<select name=\"bitrate\" id=\"bitrate\"><option value=\"128000\">128 kbps</option>"
         "<option value=\"192000\">192 kbps</option><option value=\"256000\" selected>256 kbps</option>"
         "<option value=\"320000\">320 kbps</option></select><br><br>"
@@ -262,7 +263,7 @@ static void publish_all_discovery(void) {
     publish_discovery("button", "factory_reset", "Factory Reset", "command_topic", reset_cmd, NULL);
     publish_discovery("button", "update", "Install Update", "command_topic", update_cmd, NULL);
 
-    esp_mqtt_client_publish(client, stream_url_t, "http://turntable.local/stream.mp3", 0, 1, true);
+    esp_mqtt_client_publish(client, stream_url_t, "http://turntable.local/stream.aac", 0, 1, true);
     esp_mqtt_client_publish(client, availability_topic, "online", 0, 1, true);
 }
 
@@ -367,7 +368,7 @@ void mqtt_manager_set_streaming(bool streaming) {
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c" "ota_manager.c" "mqtt_manager.c"
                      INCLUDE_DIRS "."
                      REQUIRES nvs_flash esp_wifi esp_event log lwip esp_http_server esp_netif mdns
-                              audio_pipeline esp_peripherals audio_hal driver
+                              audio_pipeline esp_peripherals audio_hal audio_stream esp-adf-libs driver
                               esp_https_ota esp_http_client mqtt esp_hw_support
 )
 ```

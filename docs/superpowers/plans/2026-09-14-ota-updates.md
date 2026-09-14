@@ -14,7 +14,8 @@
 
 ## Global Constraints
 
-- Same as the core-hardening plan: no `idf.py` in this sandbox — every build/flash verification runs on your machine.
+- Toolchain is installed at `~/esp/esp-idf` (v5.3.3) and `~/esp/esp-adf` (v2.7); `IDF_PATH`/`ADF_PATH` are persistent env vars, but the toolchain's own PATH additions are not — dot-source `~/esp/esp-idf/export.ps1` in the same command as every `idf.py` call (see the core-hardening plan's Global Constraints for the exact one-liner). On-device flash/verify steps still need a human at the board.
+- ESP-ADF has no MP3 encoder — this project uses AAC throughout (see the spec's "Codec: AAC, not MP3" section and the core-hardening plan). Not directly relevant to this plan's own code, but the stream path referenced below is `/stream.aac`, not `.mp3`.
 - Flash size confirmed as 4MB (`CONFIG_ESPTOOLPY_FLASHSIZE=4MB` after this plan's Task 1; it's currently `2MB` in `sdkconfig`, which Task 1 also fixes since it was never updated to match the real hardware).
 - Spec: `docs/superpowers/specs/2026-09-14-nest-streaming-hardening-design.md`
 
@@ -242,7 +243,7 @@ void ota_manager_install_last_async(void)
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c" "ota_manager.c"
                      INCLUDE_DIRS "."
                      REQUIRES nvs_flash esp_wifi esp_event log lwip esp_http_server esp_netif mdns
-                              audio_pipeline esp_peripherals audio_hal driver
+                              audio_pipeline esp_peripherals audio_hal audio_stream esp-adf-libs driver
                               esp_https_ota esp_http_client
 )
 ```
@@ -283,7 +284,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         snprintf(status, sizeof(status),
                  "<p>Status: streaming, connected to %s (RSSI %d dBm).<br>Stream: "
-                 "<a href=\"http://turntable.local/stream.mp3\">http://turntable.local/stream.mp3</a></p>",
+                 "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
                  (char *)ap_info.ssid, ap_info.rssi);
     }
     char resp[2560];
@@ -298,7 +299,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
         "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
         "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
-        "<h2>Stream</h2><label for=\"bitrate\">MP3 Bitrate:</label><br>"
+        "<h2>Stream</h2><label for=\"bitrate\">AAC Bitrate:</label><br>"
         "<select name=\"bitrate\" id=\"bitrate\"><option value=\"128000\">128 kbps</option>"
         "<option value=\"192000\">192 kbps</option><option value=\"256000\" selected>256 kbps</option>"
         "<option value=\"320000\">320 kbps</option></select><br><br>"

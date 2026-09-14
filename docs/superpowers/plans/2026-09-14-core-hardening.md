@@ -2,25 +2,37 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Simplify the audio pipeline to the one mode Nest/Cast can actually play, and harden the firmware (Wi-Fi reconnect, a real DNS bug, a physical recovery button, LED status) — the foundation the OTA and MQTT plans build on.
+**Goal:** Simplify the audio pipeline to the one codec/mode Nest/Cast can actually play, and harden the firmware (Wi-Fi reconnect, a real DNS bug, a physical recovery button, LED status) — the foundation the OTA and MQTT plans build on.
 
-**Architecture:** No new files. `app_config.h` drops the multi-mode struct down to the fields MP3-only streaming needs; `audio_streamer.c` keeps only the MP3→HTTP branch; `wifi_manager.c` gains reconnect logic, a bug fix, a second (STA-mode) instance of its existing web server, and board-control init (button + LED) shared via one `esp_periph_set`.
+**Architecture:** No new files. `app_config.h` drops the multi-mode struct down to the fields AAC-only streaming needs; `audio_streamer.c` keeps only the AAC→HTTP branch; `wifi_manager.c` gains reconnect logic, a bug fix, a second (STA-mode) instance of its existing web server, and board-control init (button + LED) shared via one `esp_periph_set`.
 
-**Tech Stack:** ESP-IDF 5.3.3 (target `esp32`), ESP-ADF, board `ESP-LyraT V4.3` (`CONFIG_ESP_LYRAT_V4_3_BOARD=y`).
+**Tech Stack:** ESP-IDF 5.3.3 (target `esp32`), ESP-ADF v2.7, board `ESP-LyraT V4.3` (`CONFIG_ESP_LYRAT_V4_3_BOARD=y`).
 
 **Spec:** `docs/superpowers/specs/2026-09-14-nest-streaming-hardening-design.md`
 
 ## Global Constraints
 
-- This sandbox has no `IDF_PATH`/`ADF_PATH`/`idf.py` — every task's "Verify: build" step must be run on a machine with the ESP-IDF + ESP-ADF toolchain installed (yours). This session/agent cannot run it and must not claim it passed without you reporting the output.
-- No existing test framework (confirmed in `CLAUDE.md`). Verification per task is `idf.py build` (must compile clean) plus the referenced step from the spec's "Verification" section (manual, on-device — you run it, not the agent).
-- ESP-ADF symbol names below (`es8388_set_mic_gain`, `es_mic_gain_t`, `periph_button_cfg_t`, `periph_button_event_id_t`, `GREEN_LED_GPIO`, `BUTTON_REC_ID`/`GPIO_NUM_36`) were verified against `github.com/espressif/esp-adf` commit `49f80aa` (audio_hal, esp_peripherals, audio_board/lyrat_v4_3 components). If your local `$ADF_PATH` checkout is a materially different version, `grep` it for these names before compiling and adjust this plan if any have changed.
+- Toolchain is installed at `~/esp/esp-idf` (v5.3.3) and `~/esp/esp-adf` (v2.7); `IDF_PATH`/`ADF_PATH` are set as persistent user env vars, but the toolchain's own PATH additions (compiler, cmake, ninja) are **not** persistent — every build command must first dot-source `~/esp/esp-idf/export.ps1` (PowerShell) in the same invocation, e.g.: `. "$env:USERPROFILE\esp\esp-idf\export.ps1"; $env:ADF_PATH = "$env:USERPROFILE\esp\esp-adf"; idf.py build`.
+- No existing test framework (confirmed in `CLAUDE.md`). Verification per task is `idf.py build` (must compile clean) plus the referenced step from the spec's "Verification" section (manual, on-device — a human runs the on-device parts, not the agent).
+- **ESP-ADF has no MP3 encoder** (confirmed against the local v2.7 checkout — see the spec's "Codec: AAC, not MP3" section). This plan uses AAC (`aac_encoder.h`, component `esp-adf-libs`) throughout. Don't reintroduce `mp3_encoder.h`/`rtsp_stream.h` — neither exists in ESP-ADF.
+- ESP-ADF component names verified against the local `~/esp/esp-adf` v2.7 checkout (not just headers — actual `idf_component_register`/`register_component` component names, since IDF resolves `REQUIRES` by component name, not header path): `i2s_stream.h`/`http_stream.h` → component **`audio_stream`**; `aac_encoder.h`/`wav_encoder.h` → component **`esp-adf-libs`**; `es8388.h` → component **`audio_hal`**. If your `$ADF_PATH` checkout is a materially different version, `grep` its `components/*/CMakeLists.txt` for these before compiling.
+- ESP-ADF symbol names for the button/LED work (`periph_button_cfg_t`, `periph_button_event_id_t`, `GREEN_LED_GPIO`, `BUTTON_REC_ID`/`GPIO_NUM_36`) were verified against `github.com/espressif/esp-adf` commit `49f80aa` (same v2.7 release).
 - Board confirmed: LyraT V4.3, 4MB flash, ESP-IDF 5.3.3, target `esp32` (all from `sdkconfig`).
-- Flash size stays at `CONFIG_ESPTOOLPY_FLASHSIZE=2MB` for this plan — that only matters for the OTA plan's partition table, not here.
+- Flash size stays at the checked-in `CONFIG_ESPTOOLPY_FLASHSIZE=2MB` for this plan even though the real hardware is 4MB (confirmed earlier) — the OTA plan's Task 1 corrects it alongside switching to the custom OTA partition table. Don't change it here.
+- Root `CMakeLists.txt` had a real bug independent of this plan: `project.cmake` was `include()`-d twice and in the wrong order relative to ESP-ADF's own `CMakeLists.txt`, which made `project()` recurse into itself and crash `cmake`. Already fixed (verified against ESP-ADF's own example projects) to:
+  ```
+  cmake_minimum_required(VERSION 3.5)
+
+  include($ENV{ADF_PATH}/CMakeLists.txt)
+  include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+  project(turntable_streamer)
+  ```
+  Don't touch this file in this plan unless something regresses it.
 
 ---
 
-### Task 1: MP3-only pipeline, input gain, CPU headroom
+### Task 1: AAC-only pipeline, input gain, CPU headroom
 
 **Files:**
 - Modify: `main/app_config.h`
@@ -31,7 +43,7 @@
 
 **Interfaces:**
 - Produces: `app_config_t { char ssid[32]; char password[64]; int bitrate; int input_gain_db; }` — the shape every later task (and the OTA/MQTT plans) reads/writes via NVS key `CONFIG_NVS_KEY` in namespace `"storage"`.
-- Produces: `audio_streamer_start(const app_config_t *config)` — signature unchanged, behavior now MP3-only.
+- Produces: `audio_streamer_start(const app_config_t *config)` — signature unchanged, behavior now AAC-only.
 
 - [ ] **Step 1: Rewrite `app_config.h`**
 
@@ -44,19 +56,24 @@
 typedef struct {
     char ssid[32];
     char password[64];
-    int bitrate;        // MP3 encoder bitrate in bps (128000/192000/256000/320000)
+    int bitrate;        // AAC encoder bitrate in bps (128000/192000/256000/320000)
     int input_gain_db;  // ES8388 line-in gain: 0,3,6,9,12,15,18,21, or 24 (dB)
 } app_config_t;
 
 #endif // APP_CONFIG_H
 ```
 
-- [ ] **Step 2: Rewrite `audio_streamer.c` to the single MP3 branch and apply gain**
+- [ ] **Step 2: Rewrite `audio_streamer.c` to the single AAC branch and apply gain**
+
+ESP-ADF has no MP3 encoder (see Global Constraints) — this uses `aac_encoder.h`
+(`aac_encoder_cfg_t`/`aac_encoder_init()`, component `esp-adf-libs`), stereo
+44.1kHz, whose valid bitrate range comfortably covers all four dropdown
+options (128k/192k/256k/320k).
 
 ```c
 /**
  * @file audio_streamer.c
- * @brief MP3-over-HTTP audio streamer: I2S line-in -> MP3 encoder -> HTTP server.
+ * @brief AAC-over-HTTP audio streamer: I2S line-in -> AAC encoder -> HTTP server.
  */
 
 #include <esp_log.h>
@@ -66,7 +83,7 @@ typedef struct {
 #include "audio_element.h"
 #include "board.h"
 #include "i2s_stream.h"
-#include "mp3_encoder.h"
+#include "aac_encoder.h"
 #include "http_stream.h"
 #include "es8388.h"
 
@@ -94,22 +111,22 @@ void audio_streamer_start(const app_config_t *config)
     i2s_cfg.type = AUDIO_STREAM_READER;
     audio_element_handle_t i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
-    ESP_LOGI(TAG, "Configuring MP3 encoder...");
-    mp3_encoder_cfg_t mp3_cfg = DEFAULT_MP3_ENCODER_CONFIG();
-    mp3_cfg.bitrate = config->bitrate;
-    audio_element_handle_t encoder = mp3_encoder_init(&mp3_cfg);
+    ESP_LOGI(TAG, "Configuring AAC encoder...");
+    aac_encoder_cfg_t aac_cfg = DEFAULT_AAC_ENCODER_CONFIG();
+    aac_cfg.bitrate = config->bitrate;
+    audio_element_handle_t encoder = aac_encoder_init(&aac_cfg);
 
     ESP_LOGI(TAG, "Configuring HTTP stream writer...");
     http_stream_cfg_t http_cfg = HTTP_STREAM_CFG_DEFAULT();
     http_cfg.type = AUDIO_STREAM_WRITER;
     audio_element_handle_t stream_writer = http_stream_init(&http_cfg);
-    http_stream_set_uri(stream_writer, "/stream.mp3");
+    http_stream_set_uri(stream_writer, "/stream.aac");
 
-    ESP_LOGI(TAG, "Linking elements: i2s -> mp3 -> http");
+    ESP_LOGI(TAG, "Linking elements: i2s -> aac -> http");
     audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
-    audio_pipeline_register(pipeline, encoder, "mp3");
+    audio_pipeline_register(pipeline, encoder, "aac");
     audio_pipeline_register(pipeline, stream_writer, "http");
-    const char *link[3] = {"i2s", "mp3", "http"};
+    const char *link[3] = {"i2s", "aac", "http"};
     audio_pipeline_link(pipeline, &link[0], 3);
 
     ESP_LOGI(TAG, "Initializing mDNS service...");
@@ -117,7 +134,7 @@ void audio_streamer_start(const app_config_t *config)
     mdns_hostname_set("turntable");
     mdns_instance_name_set("Turntable Audio Streamer");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-    ESP_LOGI(TAG, "mDNS initialized. Stream available at: http://turntable.local/stream.mp3");
+    ESP_LOGI(TAG, "mDNS initialized. Stream available at: http://turntable.local/stream.aac");
 
     ESP_LOGI(TAG, "Starting audio pipeline...");
     audio_pipeline_run(pipeline);
@@ -132,7 +149,7 @@ Replace the `root_get_handler` body's `resp_str` literal (drop the mode radios/J
 ```c
     const char* resp_str = (const char*) R"rawliteral(
     <!DOCTYPE html><html><head><title>Turntable Wi-Fi Setup</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:sans-serif; background-color:#282c34; color:#fff; padding:20px;} h1,h2{color:#61afef;} input,select{padding:10px; width:calc(100% - 22px); border-radius:5px; border:1px solid #61afef; background-color:#3c4049; color:#fff;} input[type="submit"]{background-color:#98c379; color:#282c34; font-weight:bold; cursor:pointer; width:100%;}</style></head>
-    <body><h1>Turntable Wi-Fi Setup</h1><form action="/connect" method="post"><h2>Wi-Fi Credentials</h2><input type="text" name="ssid" placeholder="WiFi SSID" required><br><br><input type="password" name="password" placeholder="Password"><br><br><h2>Stream</h2><label for="bitrate">MP3 Bitrate:</label><br><select name="bitrate" id="bitrate"><option value="128000">128 kbps</option><option value="192000">192 kbps</option><option value="256000" selected>256 kbps</option><option value="320000">320 kbps</option></select><br><br><label for="gain">Line-in Gain:</label><br><select name="gain" id="gain"><option value="0">0 dB</option><option value="3">3 dB</option><option value="6">6 dB</option><option value="9">9 dB</option><option value="12" selected>12 dB</option><option value="15">15 dB</option><option value="18">18 dB</option><option value="21">21 dB</option><option value="24">24 dB</option></select><br><br><input type="submit" value="Save and Restart"></form></body></html>)rawliteral";
+    <body><h1>Turntable Wi-Fi Setup</h1><form action="/connect" method="post"><h2>Wi-Fi Credentials</h2><input type="text" name="ssid" placeholder="WiFi SSID" required><br><br><input type="password" name="password" placeholder="Password"><br><br><h2>Stream</h2><label for="bitrate">AAC Bitrate:</label><br><select name="bitrate" id="bitrate"><option value="128000">128 kbps</option><option value="192000">192 kbps</option><option value="256000" selected>256 kbps</option><option value="320000">320 kbps</option></select><br><br><label for="gain">Line-in Gain:</label><br><select name="gain" id="gain"><option value="0">0 dB</option><option value="3">3 dB</option><option value="6">6 dB</option><option value="9">9 dB</option><option value="12" selected>12 dB</option><option value="15">15 dB</option><option value="18">18 dB</option><option value="21">21 dB</option><option value="24">24 dB</option></select><br><br><input type="submit" value="Save and Restart"></form></body></html>)rawliteral";
 ```
 
 Replace `connect_post_handler` in full:
@@ -167,15 +184,19 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
 }
 ```
 
-- [ ] **Step 4: Add `audio_hal` to `main/CMakeLists.txt` REQUIRES**
+- [ ] **Step 4: Fix `main/CMakeLists.txt` REQUIRES**
 
-`es8388.h` lives in the `audio_hal` component (its `es8388` driver subfolder). Update:
+The original REQUIRES list never actually covered the headers `audio_streamer.c`
+includes (a pre-existing bug — `i2s_stream.h`/`http_stream.h`/`aac_encoder.h`/
+`es8388.h` were never resolvable). Per Global Constraints: `i2s_stream.h`/
+`http_stream.h` → component `audio_stream`; `aac_encoder.h` → component
+`esp-adf-libs`; `es8388.h` → component `audio_hal`. Update:
 
 ```
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c"
                      INCLUDE_DIRS "."
                      REQUIRES nvs_flash esp_wifi esp_event log lwip esp_http_server esp_netif mdns
-                              audio_pipeline esp_peripherals audio_hal
+                              audio_pipeline esp_peripherals audio_hal audio_stream esp-adf-libs
 )
 ```
 
@@ -197,13 +218,13 @@ Expected: clean build, no errors. (Run this on your machine — see Global Const
 
 - [ ] **Step 7: Manual verify**
 
-Spec step 2: flash, submit the form with real Wi-Fi + a bitrate/gain choice, confirm `http://turntable.local/stream.mp3` plays and the line-in signal isn't clipped/too quiet — adjust `gain` and resubmit if needed.
+Spec step 2: flash, submit the form with real Wi-Fi + a bitrate/gain choice, confirm `http://turntable.local/stream.aac` plays and the line-in signal isn't clipped/too quiet — adjust `gain` and resubmit if needed.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add main/app_config.h main/audio_streamer.c main/wifi_manager.c main/CMakeLists.txt sdkconfig
-git commit -m "Simplify to MP3-only pipeline, add input gain control, bump CPU to 240MHz"
+git commit -m "Simplify to AAC-only pipeline, add input gain control, bump CPU to 240MHz"
 ```
 
 ---
@@ -361,7 +382,7 @@ git commit -m "Add Wi-Fi auto-reconnect with backoff; fix DNS parser pointer-siz
 - Produces: `static httpd_handle_t start_webserver(uint16_t port, bool captive)` — new signature. The OTA plan (Task adding the `/ota` endpoint) registers its handler on the server this returns, so its task must apply on top of this one.
 - Consumes: `root_get_handler`, `connect_post_handler` (Task 1's versions).
 
-The audio pipeline's `http_stream` writer already runs its own embedded HTTP server on port 80 to serve `/stream.mp3` once streaming starts. The setup/config server can't also bind port 80 in STA mode — it moves to 8080 there, and drops the AP-only captive-portal wildcard redirect.
+The audio pipeline's `http_stream` writer already runs its own embedded HTTP server on port 80 to serve `/stream.aac` once streaming starts. The setup/config server can't also bind port 80 in STA mode — it moves to 8080 there, and drops the AP-only captive-portal wildcard redirect.
 
 - [ ] **Step 1: Parameterize `start_webserver` and add a status line**
 
@@ -397,7 +418,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         snprintf(status, sizeof(status),
                  "<p>Status: streaming, connected to %s (RSSI %d dBm).<br>Stream: "
-                 "<a href=\"http://turntable.local/stream.mp3\">http://turntable.local/stream.mp3</a></p>",
+                 "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
                  (char *)ap_info.ssid, ap_info.rssi);
     }
     char resp[2048];
@@ -412,7 +433,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
         "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
         "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
-        "<h2>Stream</h2><label for=\"bitrate\">MP3 Bitrate:</label><br>"
+        "<h2>Stream</h2><label for=\"bitrate\">AAC Bitrate:</label><br>"
         "<select name=\"bitrate\" id=\"bitrate\"><option value=\"128000\">128 kbps</option>"
         "<option value=\"192000\">192 kbps</option><option value=\"256000\" selected>256 kbps</option>"
         "<option value=\"320000\">320 kbps</option></select><br><br>"
@@ -573,7 +594,7 @@ Update `main/CMakeLists.txt`'s REQUIRES line to include `driver`:
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c"
                      INCLUDE_DIRS "."
                      REQUIRES nvs_flash esp_wifi esp_event log lwip esp_http_server esp_netif mdns
-                              audio_pipeline esp_peripherals audio_hal driver
+                              audio_pipeline esp_peripherals audio_hal audio_stream esp-adf-libs driver
 )
 ```
 
