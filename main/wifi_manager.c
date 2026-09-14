@@ -14,10 +14,19 @@
 #include "lwip/dns.h"
 #include "lwip/prot/dns.h"
 #include "audio_streamer.h"
+#include "esp_peripherals.h"
+#include "periph_button.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "WIFI_MANAGER";
 
 #define WIFI_AP_SSID "Turntable-Setup"
+#define REC_BUTTON_GPIO GPIO_NUM_36  // LyraT V4.3 REC button
+#define STATUS_LED_GPIO GPIO_NUM_22  // LyraT V4.3 general-purpose LED
+
+typedef enum { LED_STATE_SETUP, LED_STATE_CONNECTING, LED_STATE_STREAMING } led_state_t;
+static volatile led_state_t led_state = LED_STATE_CONNECTING;
+
 static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 
@@ -120,6 +129,54 @@ static void dns_server_task(void *pvParameters) {
 }
 
 
+static void led_task(void *arg) {
+    gpio_set_direction(STATUS_LED_GPIO, GPIO_MODE_OUTPUT);
+    bool on = false;
+    while (1) {
+        int blink_ms = (led_state == LED_STATE_SETUP) ? 800
+                      : (led_state == LED_STATE_CONNECTING) ? 200
+                      : 0; // STREAMING: solid on
+        if (blink_ms == 0) {
+            gpio_set_level(STATUS_LED_GPIO, 1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            on = !on;
+            gpio_set_level(STATUS_LED_GPIO, on);
+            vTaskDelay(pdMS_TO_TICKS(blink_ms));
+        }
+    }
+}
+
+static esp_err_t periph_callback(audio_event_iface_msg_t *event, void *context) {
+    if (event->source_type == PERIPH_ID_BUTTON && (int)event->data == REC_BUTTON_GPIO
+        && event->cmd == PERIPH_BUTTON_LONG_PRESSED) {
+        ESP_LOGW(TAG, "REC held: erasing saved Wi-Fi config and rebooting to setup mode");
+        nvs_handle_t nvs;
+        if (nvs_open("storage", NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_erase_key(nvs, CONFIG_NVS_KEY);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        esp_restart();
+    }
+    return ESP_OK;
+}
+
+static void init_controls(void) {
+    xTaskCreate(led_task, "status_led", 2048, NULL, 3, NULL);
+
+    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    esp_periph_set_handle_t periph_set = esp_periph_set_init(&periph_cfg);
+
+    periph_button_cfg_t btn_cfg = {
+        .gpio_mask = (1ULL << REC_BUTTON_GPIO),
+        .long_press_time_ms = 3000,
+    };
+    esp_periph_handle_t button_handle = periph_button_init(&btn_cfg);
+    esp_periph_start(periph_set, button_handle);
+    esp_periph_set_register_callback(periph_set, periph_callback, NULL);
+}
+
 // --- Reszta kodu bez zmian (ale wklej ją dla pewności) ---
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
@@ -206,6 +263,7 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
 }
 
 void wifi_manager_start(void) {
+    init_controls();
     app_config_t cfg;
     nvs_handle_t nvs;
     ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs));
@@ -218,6 +276,7 @@ void wifi_manager_start(void) {
 
 static void start_sta_mode(const app_config_t *config) {
     wifi_event_group = xEventGroupCreate();
+    led_state = LED_STATE_CONNECTING;
     const esp_timer_create_args_t reconnect_timer_args = { .callback = &wifi_reconnect_timer_cb, .name = "wifi_reconnect" };
     esp_timer_create(&reconnect_timer_args, &wifi_reconnect_timer);
     ESP_ERROR_CHECK(esp_netif_init());
@@ -236,6 +295,7 @@ static void start_sta_mode(const app_config_t *config) {
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP. Starting audio streamer.");
+        led_state = LED_STATE_STREAMING;
         audio_streamer_start(config);
         start_webserver(8080, false);
     }
@@ -252,6 +312,7 @@ static void start_captive_portal(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    led_state = LED_STATE_SETUP;
     start_dns_server();
     start_webserver(80, true);
 }
