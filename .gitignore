@@ -18,3 +18,5 @@
 # Inne pliki tymczasowe, które mogą się pojawić
 *.bak
 *.tmp
+# Local git worktrees (superpowers subagent-driven-development)
+/.worktrees/
