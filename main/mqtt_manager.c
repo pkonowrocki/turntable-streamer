@@ -12,6 +12,7 @@
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <esp_mac.h>
+#include <esp_netif.h>
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include "freertos/FreeRTOS.h"
@@ -49,6 +50,19 @@ static void publish_discovery(const char *component, const char *object_id, cons
     esp_mqtt_client_publish(client, discovery_topic, payload, 0, 1, true);
 }
 
+// Builds "http://<ip>/stream.aac" from the STA interface's current IP. Google Cast
+// devices (and this project's earlier Windows testing) don't reliably resolve
+// turntable.local, so Home Assistant needs a real IP to actually cast to a Nest speaker.
+static void get_stream_url(char *out, size_t out_len) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip_info;
+    if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+        snprintf(out, out_len, "http://" IPSTR "/stream.aac", IP2STR(&ip_info.ip));
+    } else {
+        snprintf(out, out_len, "http://turntable.local/stream.aac"); // fallback if IP isn't available yet
+    }
+}
+
 static void publish_all_discovery(void) {
     char stream_url_t[40], streaming_t[40], rssi_t[40];
     char restart_cmd[40], reset_cmd[40], update_cmd[40];
@@ -68,7 +82,9 @@ static void publish_all_discovery(void) {
     publish_discovery("button", "factory_reset", "Factory Reset", "command_topic", reset_cmd, NULL);
     publish_discovery("button", "update", "Install Update", "command_topic", update_cmd, NULL);
 
-    esp_mqtt_client_publish(client, stream_url_t, "http://turntable.local/stream.aac", 0, 1, true);
+    char stream_url[48];
+    get_stream_url(stream_url, sizeof(stream_url));
+    esp_mqtt_client_publish(client, stream_url_t, stream_url, 0, 1, true);
     esp_mqtt_client_publish(client, availability_topic, "online", 0, 1, true);
 }
 

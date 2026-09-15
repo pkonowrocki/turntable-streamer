@@ -532,7 +532,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         led_state = LED_STATE_CONNECTING;
         int delay_ms = wifi_backoff_ms(wifi_retry_count++);
-        ESP_LOGW(TAG, "Wi-Fi disconnected, retrying in %d ms", delay_ms);
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason %d), retrying in %d ms", disc ? disc->reason : -1, delay_ms);
         esp_timer_stop(wifi_reconnect_timer); // no-op if not currently active
         esp_err_t timer_err = esp_timer_start_once(wifi_reconnect_timer, (uint64_t)delay_ms * 1000);
         if (timer_err != ESP_OK) {
