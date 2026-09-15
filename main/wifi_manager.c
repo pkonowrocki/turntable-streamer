@@ -17,6 +17,7 @@
 #include "esp_peripherals.h"
 #include "periph_button.h"
 #include "driver/gpio.h"
+#include "ota_manager.h"
 
 static const char *TAG = "WIFI_MANAGER";
 
@@ -178,7 +179,7 @@ static void init_controls(void) {
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    char status[240] = "";
+    char status[240] = ""; // 240, not 160 -- 160 was too small for a realistic max SSID+RSSI (found in core-hardening's final review)
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         snprintf(status, sizeof(status),
@@ -186,7 +187,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
                  "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
                  (char *)ap_info.ssid, ap_info.rssi);
     }
-    char resp[2048];
+    char resp[2560];
     int n = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head><title>Turntable Setup</title>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -207,9 +208,28 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<option value=\"9\">9 dB</option><option value=\"12\" selected>12 dB</option>"
         "<option value=\"15\">15 dB</option><option value=\"18\">18 dB</option>"
         "<option value=\"21\">21 dB</option><option value=\"24\">24 dB</option></select><br><br>"
-        "<input type=\"submit\" value=\"Save and Restart\"></form></body></html>",
+        "<input type=\"submit\" value=\"Save and Restart\"></form>"
+        "<h2>Firmware Update</h2><form action=\"/ota\" method=\"post\">"
+        "<input type=\"text\" name=\"url\" placeholder=\"https://.../firmware.bin\"><br><br>"
+        "<input type=\"submit\" value=\"Install Update\"></form></body></html>",
         status);
     httpd_resp_send(req, resp, n);
+    return ESP_OK;
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req) {
+    char buf[300];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    char url[256];
+    if (httpd_query_key_value(buf, "url", url, sizeof(url)) == ESP_OK && strlen(url) > 0) {
+        ESP_LOGI(TAG, "OTA requested: %s", url);
+        httpd_resp_send(req, "<h1>Installing update. Device will reboot if it succeeds.</h1>", -1);
+        ota_manager_install_async(url);
+    } else {
+        httpd_resp_send(req, "<h1>Error: missing firmware url.</h1>", -1);
+    }
     return ESP_OK;
 }
 
@@ -252,8 +272,8 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
-    config.stack_size = 8192; // root_get_handler's resp[2048]+status[240] locals overflow the 4096-byte default
-    config.max_uri_handlers = 4;
+    config.stack_size = 8192; // root_get_handler's resp[2560]+status[240] locals overflow the 4096-byte default
+    config.max_uri_handlers = 8;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed on port %u", port);
@@ -263,6 +283,8 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_register_uri_handler(server, &root_uri);
     httpd_uri_t connect_uri = {.uri = "/connect", .method = HTTP_POST, .handler = connect_post_handler};
     httpd_register_uri_handler(server, &connect_uri);
+    httpd_uri_t ota_uri = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler};
+    httpd_register_uri_handler(server, &ota_uri);
     if (captive) {
         httpd_uri_t wildcard = {.uri = "/*", .method = HTTP_GET, .handler = root_get_handler};
         httpd_register_uri_handler(server, &wildcard);
