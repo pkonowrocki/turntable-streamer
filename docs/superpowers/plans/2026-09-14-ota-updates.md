@@ -196,7 +196,7 @@ Replace `root_get_handler`'s `snprintf` call in full (same as the core-hardening
 
 ```c
 static esp_err_t root_get_handler(httpd_req_t *req) {
-    char status[160] = "";
+    char status[240] = ""; // 240, not 160 -- 160 was too small for a realistic max SSID+RSSI (found in core-hardening's final review)
     wifi_ap_record_t ap_info;
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
         snprintf(status, sizeof(status),
