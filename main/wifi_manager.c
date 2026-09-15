@@ -252,6 +252,7 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
+    config.stack_size = 8192; // root_get_handler's resp[2048]+status[240] locals overflow the 4096-byte default
     config.max_uri_handlers = 4;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) != ESP_OK) {
