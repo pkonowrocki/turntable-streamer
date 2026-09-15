@@ -17,10 +17,22 @@
 #include "aac_encoder.h"
 #include "raw_stream.h"
 #include "es8388.h"
+#include "equalizer.h"
 
 #include "audio_streamer.h"
 
 static const char *TAG = "AUDIO_STREAMER";
+
+// ponytail: measured via FFT on a captured stream -- 50Hz mains hum plus harmonics at
+// 100/150/200/250/300/400/500Hz, ~38dB below signal peak. ESP-ADF's equalizer is a 10-band
+// graphic EQ (band centers below), not a surgical notch, so this cuts the lowest 3 bands
+// (31/62/125Hz -- mostly rumble territory, below where most turntable program content lives)
+// instead of trying to notch every harmonic individually. Revisit with narrower cuts if this
+// turns out to eat too much real bass.
+// Band centers at 44100/48000Hz: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz.
+// Stereo needs 20 entries (10 bands x L+R, per equalizer.h); both channels get the same cut.
+static int s_hum_filter_gain[20] = {-13, -10, -6, 0, 0, 0, 0, 0, 0, 0, -13, -10, -6, 0, 0, 0, 0, 0, 0, 0};
+static int s_flat_gain[20]       = {0};
 
 // ponytail: raw_stream's ring buffer is a single shared FIFO, so two
 // simultaneous GET clients would split one stream's bytes rather than each
@@ -52,9 +64,13 @@ static void start_stream_server(void)
     httpd_config_t httpd_cfg = HTTPD_DEFAULT_CONFIG();
     httpd_cfg.server_port = 80;
     httpd_cfg.stack_size = 8192; // headroom for stream_get_handler's 1KB stack buffer + httpd overhead
-    if (httpd_start(&server, &httpd_cfg) == ESP_OK) {
+    esp_err_t err = httpd_start(&server, &httpd_cfg);
+    if (err == ESP_OK) {
         httpd_uri_t stream_uri = {.uri = "/stream.aac", .method = HTTP_GET, .handler = stream_get_handler};
         httpd_register_uri_handler(server, &stream_uri);
+        ESP_LOGI(TAG, "HTTP stream server started on port %d", httpd_cfg.server_port);
+    } else {
+        ESP_LOGE(TAG, "httpd_start failed on port %d: %s", httpd_cfg.server_port, esp_err_to_name(err));
     }
 }
 
@@ -97,6 +113,13 @@ void audio_streamer_start(const app_config_t *config)
     i2s_cfg.type = AUDIO_STREAM_READER;
     audio_element_handle_t i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
+    ESP_LOGI(TAG, "Configuring hum filter (equalizer, %s)...", config->hum_filter_enabled ? "on" : "off");
+    equalizer_cfg_t eq_cfg = DEFAULT_EQUALIZER_CONFIG();
+    eq_cfg.samplerate = 44100; // must match I2S_STREAM_CFG_DEFAULT()'s rate
+    eq_cfg.channel = 2;
+    eq_cfg.set_gain = config->hum_filter_enabled ? s_hum_filter_gain : s_flat_gain;
+    audio_element_handle_t equalizer = equalizer_init(&eq_cfg);
+
     ESP_LOGI(TAG, "Configuring AAC encoder...");
     aac_encoder_cfg_t aac_cfg = DEFAULT_AAC_ENCODER_CONFIG();
     aac_cfg.bitrate = config->bitrate;
@@ -107,12 +130,13 @@ void audio_streamer_start(const app_config_t *config)
     raw_cfg.type = AUDIO_STREAM_READER;
     s_raw_reader = raw_stream_init(&raw_cfg);
 
-    ESP_LOGI(TAG, "Linking elements: i2s -> aac -> raw");
+    ESP_LOGI(TAG, "Linking elements: i2s -> equalizer -> aac -> raw");
     audio_pipeline_register(pipeline, i2s_stream_reader, "i2s");
+    audio_pipeline_register(pipeline, equalizer, "equalizer");
     audio_pipeline_register(pipeline, encoder, "aac");
     audio_pipeline_register(pipeline, s_raw_reader, "raw");
-    const char *link[3] = {"i2s", "aac", "raw"};
-    audio_pipeline_link(pipeline, &link[0], 3);
+    const char *link[4] = {"i2s", "equalizer", "aac", "raw"};
+    audio_pipeline_link(pipeline, &link[0], 4);
 
     ESP_LOGI(TAG, "Starting HTTP stream server on port 80...");
     start_stream_server();
