@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <esp_log.h>
 #include <esp_https_ota.h>
 #include <esp_http_client.h>
@@ -51,20 +52,29 @@ static void install(const char *url)
     ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
 }
 
+static volatile bool ota_busy = false;
+
 static void install_task(void *arg)
 {
     ota_task_arg_t *a = (ota_task_arg_t *)arg;
     install(a->url);
     free(a);
+    ota_busy = false;
     vTaskDelete(NULL);
 }
 
 void ota_manager_install_async(const char *url)
 {
+    if (ota_busy) {
+        ESP_LOGW(TAG, "OTA already in progress, ignoring new request");
+        return;
+    }
+    ota_busy = true;
     save_url(url);
     ota_task_arg_t *a = malloc(sizeof(ota_task_arg_t));
     if (!a) {
         ESP_LOGE(TAG, "OOM starting OTA task");
+        ota_busy = false;
         return;
     }
     strncpy(a->url, url, OTA_URL_MAX_LEN);
@@ -86,10 +96,16 @@ static void install_last_task(void *arg)
             ESP_LOGW(TAG, "No saved OTA URL to install");
         }
     }
+    ota_busy = false;
     vTaskDelete(NULL);
 }
 
 void ota_manager_install_last_async(void)
 {
+    if (ota_busy) {
+        ESP_LOGW(TAG, "OTA already in progress, ignoring new request");
+        return;
+    }
+    ota_busy = true;
     xTaskCreate(install_last_task, "ota_install_last", 8192, NULL, 5, NULL);
 }
