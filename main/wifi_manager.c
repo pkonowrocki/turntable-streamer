@@ -21,6 +21,7 @@
 #include "periph_button.h"
 #include "driver/gpio.h"
 #include "ota_manager.h"
+#include "mqtt_manager.h"
 
 static const char *TAG = "WIFI_MANAGER";
 
@@ -213,7 +214,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     // Pre-fill Stream settings with what's actually saved, not hardcoded guesses -- and this
     // read is also what lets /settings change gain/bitrate/filter without touching Wi-Fi
     // credentials at all (see settings_post_handler).
-    app_config_t current;
+    app_config_t current = {0}; // zeroed so mqtt_* stay empty ("disabled") if nothing's saved yet
     if (!load_config(&current)) { // nothing saved yet -- fall back to the same defaults as connect_post_handler
         current.bitrate = 256000;
         current.input_gain_db = 12;
@@ -225,7 +226,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     char gain_opts[400] = "";
     append_gain_options(gain_opts, sizeof(gain_opts), current.input_gain_db);
 
-    char resp[3072];
+    char resp[3584]; // was 3072 -- MQTT section adds ~400 bytes of HTML plus up to 128+32 for broker URI/username
     int n = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head><title>Turntable Setup</title>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -245,10 +246,16 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<label><input type=\"checkbox\" name=\"hum_filter\" value=\"1\" style=\"width:auto;\"%s> "
         "Reduce mains hum (cuts low bass, keep off unless you hear a 50/100Hz hum)</label><br><br>"
         "<input type=\"submit\" value=\"Save and Restart\"></form>"
+        "<form action=\"/mqtt\" method=\"post\"><h2>MQTT / Home Assistant (optional)</h2>"
+        "<input type=\"text\" name=\"mqtt_broker\" value=\"%s\" placeholder=\"mqtt://192.168.1.10:1883 (blank = disabled)\"><br><br>"
+        "<input type=\"text\" name=\"mqtt_user\" value=\"%s\" placeholder=\"MQTT username (optional)\"><br><br>"
+        "<input type=\"password\" name=\"mqtt_pass\" placeholder=\"MQTT password (leave blank to keep current)\"><br><br>"
+        "<input type=\"submit\" value=\"Save and Restart\"></form>"
         "<h2>Firmware Update</h2><form action=\"/ota\" method=\"post\">"
         "<input type=\"text\" name=\"url\" placeholder=\"https://.../firmware.bin\"><br><br>"
         "<input type=\"submit\" value=\"Install Update\"></form></body></html>",
-        status, bitrate_opts, gain_opts, current.hum_filter_enabled ? " checked" : "");
+        status, bitrate_opts, gain_opts, current.hum_filter_enabled ? " checked" : "",
+        current.mqtt_broker_uri, current.mqtt_username);
     httpd_resp_send(req, resp, n);
     return ESP_OK;
 }
@@ -359,12 +366,56 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// MQTT/Home Assistant fields only. Preserves the saved Wi-Fi credentials and stream
+// settings, same as settings_post_handler. An empty broker field disables MQTT; an empty
+// password field means "keep the currently saved password" (it's never echoed back into
+// the form, so submitting the form without retyping it would otherwise silently erase it).
+static esp_err_t mqtt_post_handler(httpd_req_t *req) {
+    char buf[300];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    app_config_t cfg;
+    if (!load_config(&cfg)) {
+        httpd_resp_send(req, "<h1>Error: no Wi-Fi configured yet.</h1>", -1);
+        return ESP_OK;
+    }
+    if (httpd_query_key_value(buf, "mqtt_broker", cfg.mqtt_broker_uri, sizeof(cfg.mqtt_broker_uri)) == ESP_OK) {
+        url_decode_inplace(cfg.mqtt_broker_uri);
+    } else {
+        cfg.mqtt_broker_uri[0] = '\0';
+    }
+    if (httpd_query_key_value(buf, "mqtt_user", cfg.mqtt_username, sizeof(cfg.mqtt_username)) == ESP_OK) {
+        url_decode_inplace(cfg.mqtt_username);
+    } else {
+        cfg.mqtt_username[0] = '\0';
+    }
+    char new_pass[64];
+    if (httpd_query_key_value(buf, "mqtt_pass", new_pass, sizeof(new_pass)) == ESP_OK) {
+        url_decode_inplace(new_pass);
+        if (new_pass[0] != '\0') {
+            strncpy(cfg.mqtt_password, new_pass, sizeof(cfg.mqtt_password) - 1);
+            cfg.mqtt_password[sizeof(cfg.mqtt_password) - 1] = '\0';
+        } // else: field left blank on purpose -- keep the existing saved password
+    }
+    ESP_LOGI(TAG, "Saving MQTT settings: broker=%s", cfg.mqtt_broker_uri[0] ? cfg.mqtt_broker_uri : "(disabled)");
+    nvs_handle_t nvs;
+    nvs_open("storage", NVS_READWRITE, &nvs);
+    nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    httpd_resp_send(req, "<h1>MQTT Settings Saved! Restarting...</h1>", -1);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
-    config.stack_size = 8192; // root_get_handler's resp[3072]+status[240] locals overflow the 4096-byte default
+    config.stack_size = 8192; // root_get_handler's resp[3584]+status[240] locals overflow the 4096-byte default
     config.max_uri_handlers = 8;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -377,6 +428,8 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_register_uri_handler(server, &connect_uri);
     httpd_uri_t settings_uri = {.uri = "/settings", .method = HTTP_POST, .handler = settings_post_handler};
     httpd_register_uri_handler(server, &settings_uri);
+    httpd_uri_t mqtt_uri = {.uri = "/mqtt", .method = HTTP_POST, .handler = mqtt_post_handler};
+    httpd_register_uri_handler(server, &mqtt_uri);
     httpd_uri_t ota_uri = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler};
     httpd_register_uri_handler(server, &ota_uri);
     if (captive) {
@@ -433,6 +486,8 @@ static void start_sta_mode(const app_config_t *config) {
         led_state = LED_STATE_STREAMING;
         audio_streamer_start(config);
         start_webserver(8080, false);
+        mqtt_manager_start(config);
+        mqtt_manager_set_streaming(true);
     }
 }
 
