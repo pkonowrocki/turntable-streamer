@@ -1,5 +1,7 @@
 #include "wifi_manager.h"
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -217,13 +219,36 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Decodes an application/x-www-form-urlencoded value in place: %XX -> byte, '+' -> space.
+static void url_decode_inplace(char *s) {
+    char *w = s;
+    while (*s) {
+        if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+            char hex[3] = { s[1], s[2], 0 };
+            *w++ = (char)strtol(hex, NULL, 16);
+            s += 3;
+        } else if (*s == '+') {
+            *w++ = ' ';
+            s++;
+        } else {
+            *w++ = *s++;
+        }
+    }
+    *w = '\0';
+}
+
 static esp_err_t ota_post_handler(httpd_req_t *req) {
-    char buf[300];
+    char buf[768];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) return ESP_FAIL;
     buf[ret] = '\0';
     char url[256];
     if (httpd_query_key_value(buf, "url", url, sizeof(url)) == ESP_OK && strlen(url) > 0) {
+        url_decode_inplace(url);
+        if (strlen(url) == 0) {
+            httpd_resp_send(req, "<h1>Error: missing firmware url.</h1>", -1);
+            return ESP_OK;
+        }
         ESP_LOGI(TAG, "OTA requested: %s", url);
         httpd_resp_send(req, "<h1>Installing update. Device will reboot if it succeeds.</h1>", -1);
         ota_manager_install_async(url);
