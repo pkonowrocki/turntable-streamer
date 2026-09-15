@@ -34,6 +34,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
     while (1) {
         int len = raw_stream_read(s_raw_reader, buf, sizeof(buf));
         if (len <= 0) {
+            httpd_resp_send_chunk(req, NULL, 0); // end the chunked response cleanly
             break;
         }
         if (httpd_resp_send_chunk(req, buf, len) != ESP_OK) {
@@ -48,6 +49,7 @@ static void start_stream_server(void)
     httpd_handle_t server = NULL;
     httpd_config_t httpd_cfg = HTTPD_DEFAULT_CONFIG();
     httpd_cfg.server_port = 80;
+    httpd_cfg.stack_size = 8192; // headroom for stream_get_handler's 1KB stack buffer + httpd overhead
     if (httpd_start(&server, &httpd_cfg) == ESP_OK) {
         httpd_uri_t stream_uri = {.uri = "/stream.aac", .method = HTTP_GET, .handler = stream_get_handler};
         httpd_register_uri_handler(server, &stream_uri);

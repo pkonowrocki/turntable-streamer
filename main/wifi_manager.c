@@ -177,8 +177,6 @@ static void init_controls(void) {
     esp_periph_set_register_callback(periph_set, periph_callback, NULL);
 }
 
-// --- Reszta kodu bez zmian (ale wklej ją dla pewności) ---
-
 static esp_err_t root_get_handler(httpd_req_t *req) {
     char status[240] = "";
     wifi_ap_record_t ap_info;
@@ -224,7 +222,13 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
     char bitrate_str[16], gain_str[8];
     if (httpd_query_key_value(buf, "ssid", cfg.ssid, sizeof(cfg.ssid)) == ESP_OK &&
         httpd_query_key_value(buf, "password", cfg.password, sizeof(cfg.password)) == ESP_OK) {
-        cfg.bitrate = (httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? atoi(bitrate_str) : 256000;
+        int bitrate = (httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? atoi(bitrate_str) : 256000;
+        // Clamp untrusted form input to a valid AAC bitrate; anything else could make
+        // aac_encoder_init() fail on the next boot after this gets persisted to NVS.
+        if (bitrate != 128000 && bitrate != 192000 && bitrate != 256000 && bitrate != 320000) {
+            bitrate = 256000;
+        }
+        cfg.bitrate = bitrate;
         int gain = (httpd_query_key_value(buf, "gain", gain_str, sizeof(gain_str)) == ESP_OK) ? atoi(gain_str) : 12;
         // Clamp untrusted form input to a valid ES8388 mic-gain step (0-24dB, multiples of 3).
         if (gain < 0) gain = 0;
@@ -247,17 +251,20 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
+    config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
     config.max_uri_handlers = 4;
     config.uri_match_fn = httpd_uri_match_wildcard;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root_uri = {.uri = "/", .method = HTTP_GET, .handler = root_get_handler};
-        httpd_register_uri_handler(server, &root_uri);
-        httpd_uri_t connect_uri = {.uri = "/connect", .method = HTTP_POST, .handler = connect_post_handler};
-        httpd_register_uri_handler(server, &connect_uri);
-        if (captive) {
-            httpd_uri_t wildcard = {.uri = "/*", .method = HTTP_GET, .handler = root_get_handler};
-            httpd_register_uri_handler(server, &wildcard);
-        }
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed on port %u", port);
+        return NULL;
+    }
+    httpd_uri_t root_uri = {.uri = "/", .method = HTTP_GET, .handler = root_get_handler};
+    httpd_register_uri_handler(server, &root_uri);
+    httpd_uri_t connect_uri = {.uri = "/connect", .method = HTTP_POST, .handler = connect_post_handler};
+    httpd_register_uri_handler(server, &connect_uri);
+    if (captive) {
+        httpd_uri_t wildcard = {.uri = "/*", .method = HTTP_GET, .handler = root_get_handler};
+        httpd_register_uri_handler(server, &wildcard);
     }
     return server;
 }
@@ -321,9 +328,14 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        led_state = LED_STATE_CONNECTING;
         int delay_ms = wifi_backoff_ms(wifi_retry_count++);
         ESP_LOGW(TAG, "Wi-Fi disconnected, retrying in %d ms", delay_ms);
-        esp_timer_start_once(wifi_reconnect_timer, (uint64_t)delay_ms * 1000);
+        esp_timer_stop(wifi_reconnect_timer); // no-op if not currently active
+        esp_err_t timer_err = esp_timer_start_once(wifi_reconnect_timer, (uint64_t)delay_ms * 1000);
+        if (timer_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to schedule Wi-Fi reconnect: %s", esp_err_to_name(timer_err));
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         wifi_retry_count = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
