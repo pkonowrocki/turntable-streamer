@@ -22,6 +22,8 @@
 #include "driver/gpio.h"
 #include "ota_manager.h"
 #include "mqtt_manager.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "WIFI_MANAGER";
 
@@ -44,6 +46,7 @@ static void start_sta_mode(const app_config_t *config);
 static void start_captive_portal(void);
 static void dns_server_task(void *pvParameters);
 static bool load_config(app_config_t *cfg);
+static void heap_monitor_task(void *arg);
 void start_dns_server(void) { xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL); }
 
 // Exponential backoff capped at 30s, in ms. retry_count is 0-based.
@@ -439,6 +442,19 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     return server;
 }
 
+// Periodic heap diagnostic: logs free/minimum-ever heap every 60s so a slow leak (heap
+// trending down over hours, unlike a one-shot low reading right after boot) is visible
+// in the serial log without needing to add this after the fact once something's already wrong.
+static void heap_monitor_task(void *arg) {
+    while (1) {
+        ESP_LOGI(TAG, "Heap: free=%lu min_ever=%lu largest_free_block=%lu",
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        vTaskDelay(pdMS_TO_TICKS(60000));
+    }
+}
+
 // Reads the saved config from NVS. Returns false (cfg left zeroed) if none is saved yet.
 static bool load_config(app_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
@@ -488,6 +504,9 @@ static void start_sta_mode(const app_config_t *config) {
         start_webserver(8080, false);
         mqtt_manager_start(config);
         mqtt_manager_set_streaming(true);
+        ESP_LOGI(TAG, "Free heap after full init: %lu bytes (min ever since boot: %lu)",
+                 (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+        xTaskCreate(heap_monitor_task, "heap_monitor", 2048, NULL, 1, NULL);
     }
 }
 
