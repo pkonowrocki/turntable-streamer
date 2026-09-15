@@ -23,23 +23,25 @@
 
 static const char *TAG = "AUDIO_STREAMER";
 
-// ponytail: measured via FFT on a captured stream -- 50Hz mains hum plus harmonics at
-// 100/150/200/250/300/400/500Hz, ~38dB below signal peak. ESP-ADF's equalizer is a 10-band
-// graphic EQ (band centers below), not a surgical notch, so this cuts the lowest 3 bands
-// (31/62/125Hz -- mostly rumble territory, below where most turntable program content lives)
-// instead of trying to notch every harmonic individually. Revisit with narrower cuts if this
-// turns out to eat too much real bass.
-// Band centers at 44100/48000Hz: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz.
-// Stereo needs 20 entries (10 bands x L+R, per equalizer.h); both channels get the same cut.
-static int s_hum_filter_gain[20] = {-13, -10, -6, 0, 0, 0, 0, 0, 0, 0, -13, -10, -6, 0, 0, 0, 0, 0, 0, 0};
-static int s_flat_gain[20]       = {0};
-
 // ponytail: raw_stream's ring buffer is a single shared FIFO, so two
 // simultaneous GET clients would split one stream's bytes rather than each
 // getting the full thing. Fine for a single-listener hobby stream (Cast
 // normally has one active receiver anyway) -- add per-client fan-out only if
 // real multi-room playback is ever needed.
 static audio_element_handle_t s_raw_reader;
+static audio_element_handle_t s_equalizer; // kept so audio_streamer_set_eq() can adjust bands live
+// equalizer_init() stores this pointer rather than copying it (checked against esp-adf's
+// equalizer.c), so it must outlive the element -- static, not a stack-local array.
+static int s_eq_gains[20]; // 10 bands x L+R (per equalizer.h)
+
+// Band centers at 44100/48000Hz: 31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000 Hz.
+void audio_streamer_set_eq(const int gains_db[10])
+{
+    if (!s_equalizer) return; // not started yet
+    for (int band = 0; band < 10; band++) {
+        equalizer_set_gain_info(s_equalizer, band, gains_db[band], true); // true = same gain both channels
+    }
+}
 
 static esp_err_t stream_get_handler(httpd_req_t *req)
 {
@@ -113,12 +115,17 @@ void audio_streamer_start(const app_config_t *config)
     i2s_cfg.type = AUDIO_STREAM_READER;
     audio_element_handle_t i2s_stream_reader = i2s_stream_init(&i2s_cfg);
 
-    ESP_LOGI(TAG, "Configuring hum filter (equalizer, %s)...", config->hum_filter_enabled ? "on" : "off");
+    ESP_LOGI(TAG, "Configuring 10-band equalizer...");
+    for (int band = 0; band < 10; band++) {
+        s_eq_gains[band] = config->eq_gains[band];
+        s_eq_gains[band + 10] = config->eq_gains[band]; // both channels start equal
+    }
     equalizer_cfg_t eq_cfg = DEFAULT_EQUALIZER_CONFIG();
     eq_cfg.samplerate = 44100; // must match I2S_STREAM_CFG_DEFAULT()'s rate
     eq_cfg.channel = 2;
-    eq_cfg.set_gain = config->hum_filter_enabled ? s_hum_filter_gain : s_flat_gain;
-    audio_element_handle_t equalizer = equalizer_init(&eq_cfg);
+    eq_cfg.set_gain = s_eq_gains;
+    s_equalizer = equalizer_init(&eq_cfg);
+    audio_element_handle_t equalizer = s_equalizer;
 
     ESP_LOGI(TAG, "Configuring AAC encoder...");
     aac_encoder_cfg_t aac_cfg = DEFAULT_AAC_ENCODER_CONFIG();

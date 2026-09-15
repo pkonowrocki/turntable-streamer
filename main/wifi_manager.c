@@ -205,6 +205,20 @@ static void append_gain_options(char *buf, size_t buf_size, int current) {
     }
 }
 
+// Builds 10 labeled range sliders (one per equalizer band) with a live dB readout.
+static void append_eq_sliders(char *buf, size_t buf_size, const int gains[10]) {
+    static const char *band_labels[10] = {"31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz",
+                                           "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz"};
+    size_t off = strlen(buf);
+    for (int i = 0; i < 10; i++) {
+        off += snprintf(buf + off, buf_size - off,
+            "<label>%s: <output id=\"eqval%d\">%d</output> dB</label><br>"
+            "<input type=\"range\" name=\"eq%d\" min=\"-12\" max=\"12\" value=\"%d\" "
+            "oninput=\"document.getElementById('eqval%d').value=this.value\"><br>",
+            band_labels[i], i, gains[i], i, gains[i], i);
+    }
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req) {
     char status[240] = ""; // 240, not 160 -- 160 was too small for a realistic max SSID+RSSI (found in core-hardening's final review)
     wifi_ap_record_t ap_info;
@@ -221,15 +235,16 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     if (!load_config(&current)) { // nothing saved yet -- fall back to the same defaults as connect_post_handler
         current.bitrate = 256000;
         current.input_gain_db = 12;
-        current.hum_filter_enabled = 0;
     }
 
     char bitrate_opts[300] = "";
     append_bitrate_options(bitrate_opts, sizeof(bitrate_opts), current.bitrate);
     char gain_opts[400] = "";
     append_gain_options(gain_opts, sizeof(gain_opts), current.input_gain_db);
+    char eq_sliders[2200] = "";
+    append_eq_sliders(eq_sliders, sizeof(eq_sliders), current.eq_gains);
 
-    char resp[3584]; // was 3072 -- MQTT section adds ~400 bytes of HTML plus up to 128+32 for broker URI/username
+    char resp[5888]; // was 3584 -- 10-band EQ section adds ~2200 bytes of HTML
     int n = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head><title>Turntable Setup</title>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -237,7 +252,12 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "h1,h2{color:#61afef;} input,select{padding:10px;width:calc(100%% - 22px);border-radius:5px;"
         "border:1px solid #61afef;background-color:#3c4049;color:#fff;} "
         "input[type=\"submit\"]{background-color:#98c379;color:#282c34;font-weight:bold;cursor:pointer;width:100%%;}"
-        "</style></head><body><h1>Turntable Setup</h1>%s"
+        "button.preset{width:auto;padding:8px 14px;margin:4px 4px 4px 0;border-radius:5px;border:1px solid #61afef;"
+        "background-color:#3c4049;color:#fff;cursor:pointer;}"
+        "</style>"
+        "<script>function setEQ(v){for(let i=0;i<10;i++){"
+        "document.getElementsByName('eq'+i)[0].value=v[i];document.getElementById('eqval'+i).value=v[i];}}</script>"
+        "</head><body><h1>Turntable Setup</h1>%s"
         "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
         "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
         "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
@@ -246,9 +266,15 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<label for=\"bitrate\">AAC Bitrate:</label><br>"
         "<select name=\"bitrate\" id=\"bitrate\">%s</select><br><br>"
         "<label for=\"gain\">Line-in Gain:</label><br><select name=\"gain\" id=\"gain\">%s</select><br><br>"
-        "<label><input type=\"checkbox\" name=\"hum_filter\" value=\"1\" style=\"width:auto;\"%s> "
-        "Reduce mains hum (cuts low bass, keep off unless you hear a 50/100Hz hum)</label><br><br>"
         "<input type=\"submit\" value=\"Save and Restart\"></form>"
+        "<form action=\"/eq\" method=\"post\"><h2>Equalizer</h2>"
+        "<p>Presets (adjust sliders below, then Apply -- takes effect instantly, no restart):</p>"
+        "<button type=\"button\" class=\"preset\" onclick=\"setEQ([0,0,0,0,0,0,0,0,0,0])\">Flat</button>"
+        "<button type=\"button\" class=\"preset\" onclick=\"setEQ([-13,-10,-6,0,0,0,0,0,0,0])\">Reduce Hum</button>"
+        "<button type=\"button\" class=\"preset\" onclick=\"setEQ([6,4,2,0,0,0,0,0,0,0])\">Bass Boost</button>"
+        "<button type=\"button\" class=\"preset\" onclick=\"setEQ([0,0,0,0,0,0,2,4,6,6])\">Treble Boost</button>"
+        "<br><br>%s"
+        "<input type=\"submit\" value=\"Apply\"></form>"
         "<form action=\"/mqtt\" method=\"post\"><h2>MQTT / Home Assistant (optional)</h2>"
         "<input type=\"text\" name=\"mqtt_broker\" value=\"%s\" placeholder=\"mqtt://192.168.1.10:1883 (blank = disabled)\"><br><br>"
         "<input type=\"text\" name=\"mqtt_user\" value=\"%s\" placeholder=\"MQTT username (optional)\"><br><br>"
@@ -257,7 +283,7 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<h2>Firmware Update</h2><form action=\"/ota\" method=\"post\">"
         "<input type=\"text\" name=\"url\" placeholder=\"https://.../firmware.bin\"><br><br>"
         "<input type=\"submit\" value=\"Install Update\"></form></body></html>",
-        status, bitrate_opts, gain_opts, current.hum_filter_enabled ? " checked" : "",
+        status, bitrate_opts, gain_opts, eq_sliders,
         current.mqtt_broker_uri, current.mqtt_username);
     httpd_resp_send(req, resp, n);
     return ESP_OK;
@@ -313,7 +339,6 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
     if (!load_config(&cfg)) { // first-time setup (captive portal): no saved settings yet
         cfg.bitrate = 256000;
         cfg.input_gain_db = 12;
-        cfg.hum_filter_enabled = 0;
     }
     if (httpd_query_key_value(buf, "ssid", cfg.ssid, sizeof(cfg.ssid)) == ESP_OK &&
         httpd_query_key_value(buf, "password", cfg.password, sizeof(cfg.password)) == ESP_OK) {
@@ -355,9 +380,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
     if (gain < 0) gain = 0;
     if (gain > 24) gain = 24;
     cfg.input_gain_db = (gain / 3) * 3;
-    // A checkbox only appears in the POST body when checked, so its absence means "off".
-    cfg.hum_filter_enabled = (httpd_query_key_value(buf, "hum_filter", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? 1 : 0;
-    ESP_LOGI(TAG, "Saving stream settings: Bitrate=%d, Gain=%ddB, HumFilter=%d", cfg.bitrate, cfg.input_gain_db, cfg.hum_filter_enabled);
+    ESP_LOGI(TAG, "Saving stream settings: Bitrate=%d, Gain=%ddB", cfg.bitrate, cfg.input_gain_db);
     nvs_handle_t nvs;
     nvs_open("storage", NVS_READWRITE, &nvs);
     nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
@@ -366,6 +389,40 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
     httpd_resp_send(req, "<h1>Settings Saved! Restarting...</h1>", -1);
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
+    return ESP_OK;
+}
+
+// Equalizer only. Preserves everything else, same pattern as settings/mqtt handlers -- but
+// unlike those, this one does NOT restart: equalizer_set_gain_info() (via
+// audio_streamer_set_eq()) applies to the running pipeline immediately.
+static esp_err_t eq_post_handler(httpd_req_t *req) {
+    char buf[200]; // 10 fields like "eq3=-12", comfortably under this
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    app_config_t cfg;
+    if (!load_config(&cfg)) {
+        httpd_resp_send(req, "<h1>Error: no Wi-Fi configured yet.</h1>", -1);
+        return ESP_OK;
+    }
+    char key[8], val_str[8];
+    for (int band = 0; band < 10; band++) {
+        snprintf(key, sizeof(key), "eq%d", band);
+        int db = (httpd_query_key_value(buf, key, val_str, sizeof(val_str)) == ESP_OK) ? atoi(val_str) : 0;
+        if (db < -12) db = -12;
+        if (db > 12) db = 12;
+        cfg.eq_gains[band] = db;
+    }
+    ESP_LOGI(TAG, "Saving EQ: %d %d %d %d %d %d %d %d %d %d", cfg.eq_gains[0], cfg.eq_gains[1],
+             cfg.eq_gains[2], cfg.eq_gains[3], cfg.eq_gains[4], cfg.eq_gains[5], cfg.eq_gains[6],
+             cfg.eq_gains[7], cfg.eq_gains[8], cfg.eq_gains[9]);
+    nvs_handle_t nvs;
+    nvs_open("storage", NVS_READWRITE, &nvs);
+    nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    audio_streamer_set_eq(cfg.eq_gains); // live, no restart
+    httpd_resp_send(req, "<h1>Equalizer applied.</h1><a href=\"/\">Back</a>", -1);
     return ESP_OK;
 }
 
@@ -418,7 +475,7 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
-    config.stack_size = 8192; // root_get_handler's resp[3584]+status[240] locals overflow the 4096-byte default
+    config.stack_size = 12288; // root_get_handler's resp[5888]+eq_sliders[2200]+other locals overflow smaller stacks
     config.max_uri_handlers = 8;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -431,6 +488,8 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_register_uri_handler(server, &connect_uri);
     httpd_uri_t settings_uri = {.uri = "/settings", .method = HTTP_POST, .handler = settings_post_handler};
     httpd_register_uri_handler(server, &settings_uri);
+    httpd_uri_t eq_uri = {.uri = "/eq", .method = HTTP_POST, .handler = eq_post_handler};
+    httpd_register_uri_handler(server, &eq_uri);
     httpd_uri_t mqtt_uri = {.uri = "/mqtt", .method = HTTP_POST, .handler = mqtt_post_handler};
     httpd_register_uri_handler(server, &mqtt_uri);
     httpd_uri_t ota_uri = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler};
