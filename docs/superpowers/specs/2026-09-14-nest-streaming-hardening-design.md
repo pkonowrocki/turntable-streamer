@@ -122,6 +122,17 @@ instead of leaving the stream dead until a manual power cycle.
   `http_stream`'s `/stream.aac`. It serves: Wi-Fi/mode reconfiguration (as
   today), the OTA firmware-URL field, MQTT broker fields, and input gain —
   and a status view (Wi-Fi RSSI, streaming state).
+- **Accepted tradeoff (flagged in final review, recorded here deliberately):**
+  this makes `/connect` (rewrite Wi-Fi credentials + reboot) reachable,
+  unauthenticated, from anywhere on the home LAN for the device's entire
+  operational life — not just from the `Turntable-Setup` AP during initial
+  setup, as before. No endpoint in this design has authentication (the
+  whole premise is a hobby device on a trusted home network), so this isn't
+  a new category of exposure, just a wider window for the existing one.
+  Restricting `/connect` to AP-mode-only would remove the "reconfigure
+  without a factory reset" capability this section exists to provide, which
+  isn't worth it for this threat model. Revisit only if this device is ever
+  deployed somewhere the LAN itself isn't trusted.
 
 ## Physical control & status
 
