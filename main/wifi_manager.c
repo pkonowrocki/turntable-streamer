@@ -24,6 +24,7 @@
 #include "mqtt_manager.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
 
 static const char *TAG = "WIFI_MANAGER";
 
@@ -533,6 +534,14 @@ static bool load_config(app_config_t *cfg) {
 
 void wifi_manager_start(void) {
     init_controls();
+    // OTA rollback safety net: a freshly OTA-flashed image boots in "pending verify" --
+    // if it reboots again (crash, panic, watchdog) without this call, the bootloader
+    // reverts to the previous working slot on its own, next boot. Marking valid here
+    // (right after peripheral/button/LED init, before the possibly-longer-running
+    // Wi-Fi connect) catches the most common real OTA failure: a corrupt or
+    // incompatible flash write that crashes immediately. No-op if rollback isn't
+    // enabled (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) or the app is already confirmed.
+    esp_ota_mark_app_valid_cancel_rollback();
     app_config_t cfg;
     if (load_config(&cfg)) { start_sta_mode(&cfg); }
     else { start_captive_portal(); }
