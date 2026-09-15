@@ -1,6 +1,7 @@
 #include "wifi_manager.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -41,6 +42,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
 static void start_sta_mode(const app_config_t *config);
 static void start_captive_portal(void);
 static void dns_server_task(void *pvParameters);
+static bool load_config(app_config_t *cfg);
 void start_dns_server(void) { xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, NULL); }
 
 // Exponential backoff capped at 30s, in ms. retry_count is 0-based.
@@ -180,6 +182,25 @@ static void init_controls(void) {
     esp_periph_set_register_callback(periph_set, periph_callback, NULL);
 }
 
+// Builds a <select> of the fixed AAC bitrate choices with the current one marked selected.
+static void append_bitrate_options(char *buf, size_t buf_size, int current) {
+    static const int choices[] = {128000, 192000, 256000, 320000};
+    size_t off = strlen(buf);
+    for (size_t i = 0; i < sizeof(choices) / sizeof(choices[0]); i++) {
+        off += snprintf(buf + off, buf_size - off, "<option value=\"%d\"%s>%d kbps</option>",
+                         choices[i], choices[i] == current ? " selected" : "", choices[i] / 1000);
+    }
+}
+
+// Builds a <select> of the ES8388's 0-24dB (3dB step) gain choices with the current one selected.
+static void append_gain_options(char *buf, size_t buf_size, int current) {
+    size_t off = strlen(buf);
+    for (int db = 0; db <= 24; db += 3) {
+        off += snprintf(buf + off, buf_size - off, "<option value=\"%d\"%s>%d dB</option>",
+                         db, db == current ? " selected" : "", db);
+    }
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req) {
     char status[240] = ""; // 240, not 160 -- 160 was too small for a realistic max SSID+RSSI (found in core-hardening's final review)
     wifi_ap_record_t ap_info;
@@ -189,7 +210,22 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
                  "<a href=\"http://turntable.local/stream.aac\">http://turntable.local/stream.aac</a></p>",
                  (char *)ap_info.ssid, ap_info.rssi);
     }
-    char resp[2560];
+    // Pre-fill Stream settings with what's actually saved, not hardcoded guesses -- and this
+    // read is also what lets /settings change gain/bitrate/filter without touching Wi-Fi
+    // credentials at all (see settings_post_handler).
+    app_config_t current;
+    if (!load_config(&current)) { // nothing saved yet -- fall back to the same defaults as connect_post_handler
+        current.bitrate = 256000;
+        current.input_gain_db = 12;
+        current.hum_filter_enabled = 0;
+    }
+
+    char bitrate_opts[300] = "";
+    append_bitrate_options(bitrate_opts, sizeof(bitrate_opts), current.bitrate);
+    char gain_opts[400] = "";
+    append_gain_options(gain_opts, sizeof(gain_opts), current.input_gain_db);
+
+    char resp[3072];
     int n = snprintf(resp, sizeof(resp),
         "<!DOCTYPE html><html><head><title>Turntable Setup</title>"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -201,20 +237,18 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
         "<form action=\"/connect\" method=\"post\"><h2>Wi-Fi Credentials</h2>"
         "<input type=\"text\" name=\"ssid\" placeholder=\"WiFi SSID\" required><br><br>"
         "<input type=\"password\" name=\"password\" placeholder=\"Password\"><br><br>"
-        "<h2>Stream</h2><label for=\"bitrate\">AAC Bitrate:</label><br>"
-        "<select name=\"bitrate\" id=\"bitrate\"><option value=\"128000\">128 kbps</option>"
-        "<option value=\"192000\">192 kbps</option><option value=\"256000\" selected>256 kbps</option>"
-        "<option value=\"320000\">320 kbps</option></select><br><br>"
-        "<label for=\"gain\">Line-in Gain:</label><br><select name=\"gain\" id=\"gain\">"
-        "<option value=\"0\">0 dB</option><option value=\"3\">3 dB</option><option value=\"6\">6 dB</option>"
-        "<option value=\"9\">9 dB</option><option value=\"12\" selected>12 dB</option>"
-        "<option value=\"15\">15 dB</option><option value=\"18\">18 dB</option>"
-        "<option value=\"21\">21 dB</option><option value=\"24\">24 dB</option></select><br><br>"
+        "<input type=\"submit\" value=\"Save and Restart\"></form>"
+        "<form action=\"/settings\" method=\"post\"><h2>Stream</h2>"
+        "<label for=\"bitrate\">AAC Bitrate:</label><br>"
+        "<select name=\"bitrate\" id=\"bitrate\">%s</select><br><br>"
+        "<label for=\"gain\">Line-in Gain:</label><br><select name=\"gain\" id=\"gain\">%s</select><br><br>"
+        "<label><input type=\"checkbox\" name=\"hum_filter\" value=\"1\" style=\"width:auto;\"%s> "
+        "Reduce mains hum (cuts low bass, keep off unless you hear a 50/100Hz hum)</label><br><br>"
         "<input type=\"submit\" value=\"Save and Restart\"></form>"
         "<h2>Firmware Update</h2><form action=\"/ota\" method=\"post\">"
         "<input type=\"text\" name=\"url\" placeholder=\"https://.../firmware.bin\"><br><br>"
         "<input type=\"submit\" value=\"Install Update\"></form></body></html>",
-        status);
+        status, bitrate_opts, gain_opts, current.hum_filter_enabled ? " checked" : "");
     httpd_resp_send(req, resp, n);
     return ESP_OK;
 }
@@ -258,28 +292,22 @@ static esp_err_t ota_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Only Wi-Fi credentials -- ssid/password. Preserves whatever stream settings (bitrate,
+// gain, hum filter) are already saved, so reconnecting to Wi-Fi never silently resets them.
 static esp_err_t connect_post_handler(httpd_req_t *req) {
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) return ESP_FAIL;
     buf[ret] = '\0';
-    app_config_t cfg = {0};
-    char bitrate_str[16], gain_str[8];
+    app_config_t cfg;
+    if (!load_config(&cfg)) { // first-time setup (captive portal): no saved settings yet
+        cfg.bitrate = 256000;
+        cfg.input_gain_db = 12;
+        cfg.hum_filter_enabled = 0;
+    }
     if (httpd_query_key_value(buf, "ssid", cfg.ssid, sizeof(cfg.ssid)) == ESP_OK &&
         httpd_query_key_value(buf, "password", cfg.password, sizeof(cfg.password)) == ESP_OK) {
-        int bitrate = (httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? atoi(bitrate_str) : 256000;
-        // Clamp untrusted form input to a valid AAC bitrate; anything else could make
-        // aac_encoder_init() fail on the next boot after this gets persisted to NVS.
-        if (bitrate != 128000 && bitrate != 192000 && bitrate != 256000 && bitrate != 320000) {
-            bitrate = 256000;
-        }
-        cfg.bitrate = bitrate;
-        int gain = (httpd_query_key_value(buf, "gain", gain_str, sizeof(gain_str)) == ESP_OK) ? atoi(gain_str) : 12;
-        // Clamp untrusted form input to a valid ES8388 mic-gain step (0-24dB, multiples of 3).
-        if (gain < 0) gain = 0;
-        if (gain > 24) gain = 24;
-        cfg.input_gain_db = (gain / 3) * 3;
-        ESP_LOGI(TAG, "Saving config: SSID=%s, Bitrate=%d, Gain=%ddB", cfg.ssid, cfg.bitrate, cfg.input_gain_db);
+        ESP_LOGI(TAG, "Saving Wi-Fi credentials: SSID=%s", cfg.ssid);
         nvs_handle_t nvs;
         nvs_open("storage", NVS_READWRITE, &nvs);
         nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
@@ -292,12 +320,51 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Stream settings only -- bitrate/gain/hum filter. Preserves the saved Wi-Fi credentials,
+// so changing gain never requires retyping the network password (the bug this fixes).
+static esp_err_t settings_post_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) return ESP_FAIL;
+    buf[ret] = '\0';
+    app_config_t cfg;
+    if (!load_config(&cfg)) {
+        httpd_resp_send(req, "<h1>Error: no Wi-Fi configured yet.</h1>", -1);
+        return ESP_OK;
+    }
+    char bitrate_str[16], gain_str[8];
+    int bitrate = (httpd_query_key_value(buf, "bitrate", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? atoi(bitrate_str) : cfg.bitrate;
+    // Clamp untrusted form input to a valid AAC bitrate; anything else could make
+    // aac_encoder_init() fail on the next boot after this gets persisted to NVS.
+    if (bitrate != 128000 && bitrate != 192000 && bitrate != 256000 && bitrate != 320000) {
+        bitrate = 256000;
+    }
+    cfg.bitrate = bitrate;
+    int gain = (httpd_query_key_value(buf, "gain", gain_str, sizeof(gain_str)) == ESP_OK) ? atoi(gain_str) : cfg.input_gain_db;
+    // Clamp untrusted form input to a valid ES8388 mic-gain step (0-24dB, multiples of 3).
+    if (gain < 0) gain = 0;
+    if (gain > 24) gain = 24;
+    cfg.input_gain_db = (gain / 3) * 3;
+    // A checkbox only appears in the POST body when checked, so its absence means "off".
+    cfg.hum_filter_enabled = (httpd_query_key_value(buf, "hum_filter", bitrate_str, sizeof(bitrate_str)) == ESP_OK) ? 1 : 0;
+    ESP_LOGI(TAG, "Saving stream settings: Bitrate=%d, Gain=%ddB, HumFilter=%d", cfg.bitrate, cfg.input_gain_db, cfg.hum_filter_enabled);
+    nvs_handle_t nvs;
+    nvs_open("storage", NVS_READWRITE, &nvs);
+    nvs_set_blob(nvs, CONFIG_NVS_KEY, &cfg, sizeof(app_config_t));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    httpd_resp_send(req, "<h1>Settings Saved! Restarting...</h1>", -1);
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; // avoid colliding with audio_streamer.c's own httpd instance
-    config.stack_size = 8192; // root_get_handler's resp[2560]+status[240] locals overflow the 4096-byte default
+    config.stack_size = 8192; // root_get_handler's resp[3072]+status[240] locals overflow the 4096-byte default
     config.max_uri_handlers = 8;
     config.uri_match_fn = httpd_uri_match_wildcard;
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -308,6 +375,8 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     httpd_register_uri_handler(server, &root_uri);
     httpd_uri_t connect_uri = {.uri = "/connect", .method = HTTP_POST, .handler = connect_post_handler};
     httpd_register_uri_handler(server, &connect_uri);
+    httpd_uri_t settings_uri = {.uri = "/settings", .method = HTTP_POST, .handler = settings_post_handler};
+    httpd_register_uri_handler(server, &settings_uri);
     httpd_uri_t ota_uri = {.uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler};
     httpd_register_uri_handler(server, &ota_uri);
     if (captive) {
@@ -317,15 +386,21 @@ static httpd_handle_t start_webserver(uint16_t port, bool captive) {
     return server;
 }
 
+// Reads the saved config from NVS. Returns false (cfg left zeroed) if none is saved yet.
+static bool load_config(app_config_t *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    nvs_handle_t nvs;
+    if (nvs_open("storage", NVS_READWRITE, &nvs) != ESP_OK) return false;
+    size_t required_size = sizeof(*cfg);
+    esp_err_t err = nvs_get_blob(nvs, CONFIG_NVS_KEY, cfg, &required_size);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
 void wifi_manager_start(void) {
     init_controls();
     app_config_t cfg;
-    nvs_handle_t nvs;
-    ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs));
-    size_t required_size = sizeof(cfg);
-    esp_err_t err = nvs_get_blob(nvs, CONFIG_NVS_KEY, &cfg, &required_size);
-    nvs_close(nvs);
-    if (err == ESP_OK) { start_sta_mode(&cfg); }
+    if (load_config(&cfg)) { start_sta_mode(&cfg); }
     else { start_captive_portal(); }
 }
 
@@ -347,6 +422,11 @@ static void start_sta_mode(const app_config_t *config) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // ponytail: default modem-sleep power save lets the radio nap between beacons, which can
+    // make the device miss incoming TCP SYNs (connects fine, but new connections time out
+    // intermittently) -- this is a streaming device on external power, so there's no battery
+    // budget to protect; trade the power savings for reliable reachability.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP. Starting audio streamer.");
