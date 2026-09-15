@@ -1,6 +1,13 @@
 # MQTT / Home Assistant Integration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status: implemented** (commit `acd1801`). Adapted from the plan text below in two ways:
+> the web UI split into `/connect` (Wi-Fi), `/settings` (stream), and `/mqtt` (this plan's
+> fields) instead of one merged form -- the merged form was itself a bug (any settings change
+> required retyping Wi-Fi credentials), fixed in commit `1e0904f` before this plan landed. And
+> `app_config_t` also carries `hum_filter_enabled` (unrelated feature, commit `1e0904f`) which
+> the struct snippet below doesn't show. The `mqtt_manager.c` code below was used as written.
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make the device appear in Home Assistant automatically (MQTT Discovery), exposing its stream URL, streaming/Wi-Fi status, and restart/factory-reset/install-update buttons.
 
@@ -32,7 +39,7 @@
 **Interfaces:**
 - Produces: `app_config_t` gains `mqtt_broker_uri[128]`, `mqtt_username[32]`, `mqtt_password[64]` — consumed by `mqtt_manager_start` (Task 2). Empty `mqtt_broker_uri` means "MQTT disabled".
 
-- [ ] **Step 1: Extend `app_config_t` in `main/app_config.h`**
+- [x] **Step 1: Extend `app_config_t` in `main/app_config.h`**
 
 ```c
 #ifndef APP_CONFIG_H
@@ -53,7 +60,7 @@ typedef struct {
 #endif // APP_CONFIG_H
 ```
 
-- [ ] **Step 2: Add the MQTT fields to the setup form and its parser**
+- [x] **Step 2: Add the MQTT fields to the setup form and its parser**
 
 Replace `root_get_handler` in full (adds an "MQTT / Home Assistant" section before the Firmware Update section from the OTA plan; if that plan hasn't been implemented yet, drop the Firmware Update block and keep the rest):
 
@@ -141,12 +148,12 @@ static esp_err_t connect_post_handler(httpd_req_t *req) {
 
 (`httpd_query_key_value` returning `ESP_ERR_NOT_FOUND` for the MQTT fields just leaves `cfg.mqtt_*` at its `{0}`-initialized empty string, which is the "disabled" state — no extra handling needed.)
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 Run: `idf.py build`
 Expected: clean build.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add main/app_config.h main/wifi_manager.c
@@ -167,7 +174,7 @@ git commit -m "Add optional MQTT broker fields to app_config_t and the setup for
 - Consumes: `app_config_t` (Task 1), `ota_manager_install_last_async()` (OTA plan Task 2).
 - Produces: `mqtt_manager_start(const app_config_t *config)`, `mqtt_manager_set_streaming(bool streaming)` — called from `wifi_manager.c`'s `start_sta_mode`.
 
-- [ ] **Step 1: Write `main/mqtt_manager.h`**
+- [x] **Step 1: Write `main/mqtt_manager.h`**
 
 ```c
 #ifndef MQTT_MANAGER_H
@@ -190,7 +197,7 @@ void mqtt_manager_set_streaming(bool streaming);
 #endif // MQTT_MANAGER_H
 ```
 
-- [ ] **Step 2: Write `main/mqtt_manager.c`**
+- [x] **Step 2: Write `main/mqtt_manager.c`**
 
 ```c
 /**
@@ -362,7 +369,7 @@ void mqtt_manager_set_streaming(bool streaming) {
 }
 ```
 
-- [ ] **Step 3: Add the new source file and `mqtt`/`esp_hw_support` to `main/CMakeLists.txt`**
+- [x] **Step 3: Add the new source file and `mqtt`/`esp_hw_support` to `main/CMakeLists.txt`**
 
 ```
 idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c" "ota_manager.c" "mqtt_manager.c"
@@ -373,7 +380,7 @@ idf_component_register(SRCS "main.c" "wifi_manager.c" "audio_streamer.c" "ota_ma
 )
 ```
 
-- [ ] **Step 4: Call it from `wifi_manager.c`**
+- [x] **Step 4: Call it from `wifi_manager.c`**
 
 Add `#include "mqtt_manager.h"` near the top.
 
@@ -384,16 +391,16 @@ In `start_sta_mode`, inside the `if (bits & WIFI_CONNECTED_BIT)` block, after th
         mqtt_manager_set_streaming(true);
 ```
 
-- [ ] **Step 5: Build**
+- [x] **Step 5: Build**
 
 Run: `idf.py build`
 Expected: clean build.
 
-- [ ] **Step 6: Manual verify**
+- [x] **Step 6: Manual verify**
 
 Spec step 4: point `mqtt_broker` at a real broker your Home Assistant is already connected to, save, and confirm the device shows up in HA (Settings → Devices → MQTT) as "Turntable Streamer" with all six entities. Press each button entity and confirm: Restart reboots the device, Factory Reset returns it to the `Turntable-Setup` AP, Install Update re-runs the last firmware URL saved via the web form. Then stop the device (power off) and confirm HA shows it unavailable within a few seconds (the LWT `offline` message).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add main/mqtt_manager.h main/mqtt_manager.c main/CMakeLists.txt main/wifi_manager.c
