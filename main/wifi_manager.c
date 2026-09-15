@@ -24,8 +24,8 @@
 static const char *TAG = "WIFI_MANAGER";
 
 #define WIFI_AP_SSID "Turntable-Setup"
-#define REC_BUTTON_GPIO GPIO_NUM_36  // LyraT V4.3 REC button
-#define STATUS_LED_GPIO GPIO_NUM_22  // LyraT V4.3 general-purpose LED
+#define REC_BUTTON_GPIO GPIO_NUM_36  // physically labeled KEY1/MODE on this board (ai-thinker-esp32-a1s), same GPIO as LyraT's REC
+#define STATUS_LED_GPIO GPIO_NUM_22  // matches LyraT's general-purpose LED pin
 
 typedef enum { LED_STATE_SETUP, LED_STATE_CONNECTING, LED_STATE_STREAMING } led_state_t;
 static volatile led_state_t led_state = LED_STATE_CONNECTING;

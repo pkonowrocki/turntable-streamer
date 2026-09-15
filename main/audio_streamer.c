@@ -7,6 +7,8 @@
 #include <esp_log.h>
 #include <esp_http_server.h>
 #include <mdns.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "audio_pipeline.h"
 #include "audio_element.h"
@@ -60,12 +62,31 @@ void audio_streamer_start(const app_config_t *config)
 {
     ESP_LOGI(TAG, "Starting streamer. Bitrate: %d bps, input gain: %d dB", config->bitrate, config->input_gain_db);
 
+    // ponytail: settle delay before the first I2C write to the ES8388 -- cheap insurance
+    // against a boot-time power-rail race, harmless if unneeded. (Earlier I2C NACKs this
+    // session were actually caused by using the wrong board definition -- LyraT V4.3's
+    // pinout instead of this board's ai-thinker-esp32-a1s one -- now fixed via board.h.)
+    vTaskDelay(pdMS_TO_TICKS(300));
+
     ESP_LOGI(TAG, "Initializing audio board and codec...");
     audio_board_handle_t board_handle = audio_board_init();
     audio_hal_ctrl_codec(board_handle->audio_hal, AUDIO_HAL_CODEC_MODE_ENCODE, AUDIO_HAL_CTRL_START);
     // ponytail: es_mic_gain_t's values are literally the dB step (0,3,...,24 -
     // verified against esp-adf's esxxx_common.h), so a direct cast replaces a lookup table.
-    es8388_set_mic_gain((es_mic_gain_t)config->input_gain_db);
+    esp_err_t gain_err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5 && gain_err != ESP_OK; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        gain_err = es8388_set_mic_gain((es_mic_gain_t)config->input_gain_db);
+        if (gain_err != ESP_OK) {
+            ESP_LOGW(TAG, "es8388_set_mic_gain failed (attempt %d/5): %s", attempt + 1, esp_err_to_name(gain_err));
+        }
+    }
+    if (gain_err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not set input gain after 5 attempts -- codec I2C is unresponsive; "
+                       "audio will likely be silent");
+    }
 
     ESP_LOGI(TAG, "Creating audio pipeline...");
     audio_pipeline_cfg_t pipeline_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();

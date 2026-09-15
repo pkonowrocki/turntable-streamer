@@ -1,12 +1,14 @@
 # Turntable Streamer
 
-Turns a turntable (or any line-in audio source) plugged into an ESP32-LyraT V4.3
-board into a live network audio stream — playable on a Google Nest speaker, a
-computer, a phone, or anything else that can open an HTTP URL.
+Turns a turntable (or any line-in audio source) plugged into an ESP32 Audio Kit
+V2.2 (Ai-Thinker ESP32-A1S) board into a live network audio stream — playable
+on a Google Nest speaker, a computer, a phone, or anything else that can open
+an HTTP URL.
 
 ## What you need
 
-- An ESP32-LyraT V4.3 board, flashed with this firmware
+- An ESP32 Audio Kit V2.2 board (Ai-Thinker ESP32-A1S module, ES8388 codec "variant 5" —
+  the common AliExpress version), flashed with this firmware
 - A turntable (or other line-in audio source) connected to the board's line-in jack
 - Your home Wi-Fi network
 
