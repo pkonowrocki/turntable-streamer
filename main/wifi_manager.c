@@ -138,6 +138,12 @@ static void dns_server_task(void *pvParameters) {
 }
 
 
+// D4 (confirmed via on-device test: forcing this pin low turned it solidly on, and the
+// normal blink logic -- which drives it high for "solid" -- left it dark) is wired
+// active-low: GPIO low lights it, GPIO high turns it off. Flipped from the naive assumption.
+#define STATUS_LED_ON  0
+#define STATUS_LED_OFF 1
+
 static void led_task(void *arg) {
     gpio_set_direction(STATUS_LED_GPIO, GPIO_MODE_OUTPUT);
     bool on = false;
@@ -146,11 +152,11 @@ static void led_task(void *arg) {
                       : (led_state == LED_STATE_CONNECTING) ? 200
                       : 0; // STREAMING: solid on
         if (blink_ms == 0) {
-            gpio_set_level(STATUS_LED_GPIO, 1);
+            gpio_set_level(STATUS_LED_GPIO, STATUS_LED_ON);
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
             on = !on;
-            gpio_set_level(STATUS_LED_GPIO, on);
+            gpio_set_level(STATUS_LED_GPIO, on ? STATUS_LED_ON : STATUS_LED_OFF);
             vTaskDelay(pdMS_TO_TICKS(blink_ms));
         }
     }
